@@ -260,10 +260,13 @@ def episode_stream_list(ep: dict) -> dict:
     mg = ep_media_guid(eg)
     vg = ep_video_guid(eg)
     title = ep.get("ep_title", "episode")
+    # 文件名标准化（剧名 S01E01 集标题），弹幕/字幕按文件名匹配时能对上
+    show = ep.get("title", "")
+    fname = f"{show}.S01E{int(ep.get('index', 0) or 0) + 1:02d}.{title}.m3u8"
     # 与单集相同的 file/video 结构，但 guid 绑定到该集
     return {
         "files": [{
-            "guid": mg, "path": f"在线/{title}.m3u8", "file_name": title + ".m3u8",
+            "guid": mg, "path": f"在线/{show}/{fname}", "file_name": fname,
             "size": 0, "timestamp": 0, "type": 1, "sort_num": 0, "can_play": 1,
             "play_error": "", "create_time": 0, "update_time": 0,
             "parent_fv_guid": "", "file_birth_time": 0, "progress_thumb_hash_dir": "",
@@ -290,9 +293,11 @@ def stream_list(b: dict) -> dict:
     mg = media_guid(guid)
     vg = video_guid(guid)
     title = _f(b, "title")
+    # 文件名标准化（剧名.年份.备注），便于弹幕/字幕匹配
+    fname = f"{title}.{_f(b, 'year') or '0000'}.{_f(b, 'remarks') or '在线'}.m3u8"
     return {
         "files": [{
-            "guid": mg, "path": f"在线/{title}.m3u8", "file_name": title + ".m3u8",
+            "guid": mg, "path": f"在线/{fname}", "file_name": fname,
             "size": 0, "timestamp": 0, "type": 1, "sort_num": 0, "can_play": 1,
             "play_error": "", "create_time": 0, "update_time": 0,
             "parent_fv_guid": "", "file_birth_time": 0, "progress_thumb_hash_dir": "",

@@ -28,6 +28,9 @@ DEFAULTS = {
     "junk_keywords": JUNK_KEYWORDS,
     # 在线资源前排展示（在线片库更齐全，默认前排）
     "online_first": True,
+    # 资源站自动体检（health.py）：每日定时测速、连续失败自动停用、pushplus 推送
+    "health": {"enabled": True, "hour": 4, "minute": 10,
+               "fail_threshold": 2, "push": True},
     "admin_token": "",
 }
 

@@ -16,9 +16,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import os
 import re
 import time
+from pathlib import Path
 import urllib.parse
 from contextlib import asynccontextmanager
 
@@ -28,6 +30,7 @@ from fastapi.responses import (JSONResponse, RedirectResponse,
                                StreamingResponse)
 
 import providers
+import health
 import inject as inj
 import config as cfgmod
 from config import config
@@ -40,6 +43,57 @@ UPSTREAM_SOCK = os.environ.get("FNMEDIA_UPSTREAM_SOCK",
                                "/var/run/trim_media_upstream.sock")
 ONLINE_PREFIX = "/v/media/online"
 _search_cache: dict[str, tuple[float, list, bool]] = {}
+# 线路速度统计：provider -> {ewma_ms, n, fails, last}（分片实测，卡顿自动换线用）
+_SEG_STATE = Path(__file__).resolve().parent.parent / "state" / "seg_stats.json"
+_seg_stats: dict[str, dict] = {}
+_seg_dirty = False
+_seg_last_save = 0.0
+
+
+def _seg_load() -> None:
+    global _seg_stats
+    try:
+        _seg_stats = json.loads(_SEG_STATE.read_text())
+    except Exception:
+        _seg_stats = {}
+
+
+def _seg_flush() -> None:
+    global _seg_dirty, _seg_last_save
+    if not _seg_dirty:
+        return
+    try:
+        _SEG_STATE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _SEG_STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_seg_stats, ensure_ascii=False))
+        tmp.replace(_SEG_STATE)
+        _seg_dirty = False
+        _seg_last_save = time.time()
+    except Exception:
+        pass
+
+
+def _seg_record(provider: str, ms: float, ok: bool) -> None:
+    global _seg_dirty
+    if not provider:
+        return
+    st = _seg_stats.setdefault(
+        provider, {"ewma_ms": float(ms), "n": 0, "fails": 0, "last": 0.0})
+    st["ewma_ms"] = round(st["ewma_ms"] * 0.7 + ms * 0.3, 1) if st["n"] else round(ms, 1)
+    st["n"] = int(st["n"]) + 1
+    st["fails"] = 0 if ok else int(st.get("fails", 0)) + 1
+    st["last"] = time.time()
+    _seg_dirty = True
+    if time.time() - _seg_last_save > 60:
+        _seg_flush()
+
+
+def _speed_rank(provider: str) -> float:
+    """线路排序键：越小越快。没实测过的给中性值，排在中游。"""
+    st = _seg_stats.get(provider)
+    if not st:
+        return 2000.0
+    return float(st.get("ewma_ms", 2000)) + int(st.get("fails", 0)) * 800
 _PARTIAL_TTL = 15.0   # 只抓了部分源的结果缓存时间
 _SEARCH_BUDGET = 2.0  # 在线搜索总预算（秒），留 1s 给本地响应和收尾（总时限 3s）
 CACHE_TTL = 120
@@ -60,7 +114,12 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(120), trust_env=False)
     app.state.ext = httpx.AsyncClient(
         timeout=httpx.Timeout(30), trust_env=False, follow_redirects=True)
+    _seg_load()
+    tasks = [asyncio.create_task(health.loop())]
     yield
+    for t in tasks:
+        t.cancel()
+    _seg_flush()
     await app.state.up.aclose()
     await app.state.ext.aclose()
 
@@ -521,6 +580,14 @@ async def play_play(request: Request):
     chosen_line = None
     if len(choices) > 1:
         chosen_line = _line_of_bitrate(body.get("bitrate"), [t["line"] for t in choices])
+        if chosen_line is None:
+            # 播放器没指定线路：选实测最快的源（无数据时保持原线路）
+            ranked = sorted(
+                choices, key=lambda t: _speed_rank(t["line"].split("::", 1)[0]))
+            if ranked and ranked[0]["line"] != base_target.get("line") \
+                    and _speed_rank(ranked[0]["line"].split("::", 1)[0]) < \
+                    _speed_rank(base_target.get("line", "").split("::", 1)[0]):
+                chosen_line = ranked[0]["line"]
     if chosen_line and chosen_line != base_target.get("line"):
         if base_target.get("kind") == "episode" and base_target.get("ep_guid"):
             target = store.get_episode_target(base_target["ep_guid"], chosen_line) or base_target
@@ -819,10 +886,15 @@ async def hls_preset(mg: str, request: Request):
     else:
         # 多线路：无 RESOLUTION 的变体，飞牛 HLS 播放器呈现为可切换「线路」
         out = ["#EXTM3U", "#EXT-X-VERSION:3"]
+        # 按实测速度排序（快在前），快的线路给更大的 BANDWIDTH，
+        # 播放器 ABR 会优先选带宽最大的变体 → 默认走快线
+        hls_targets = sorted(
+            hls_targets,
+            key=lambda t: _speed_rank(t["line"].split("::", 1)[0]))
         for i, t in enumerate(hls_targets):
             name = _friendly_line(t["line"])
             # NAME 供支持的播放器显示线路名；BANDWIDTH 差异化避免被合并
-            out.append(f'#EXT-X-STREAM-INF:BANDWIDTH={1000000 + i * 100000},'
+            out.append(f'#EXT-X-STREAM-INF:BANDWIDTH={3000000 - i * 100000},'
                        f'PROGRAM-ID=1,NAME="{name}"')
             out.append(variant_uri(t))
         master = "\n".join(out) + "\n"
@@ -934,10 +1006,16 @@ async def hls_seg(mg: str, request: Request):
     fwd = dict(headers)
     if "range" in request.headers:
         fwd["Range"] = request.headers["range"]
+    t0 = time.monotonic()
     try:
         r = await ext_client(request).get(src_url, headers=fwd)
     except Exception as exc:
+        _seg_record(picked["line"].split("::", 1)[0] if picked else "",
+                    (time.monotonic() - t0) * 1000, False)
         return Response(f"seg fail {type(exc).__name__}", status_code=502)
+    _seg_record(picked["line"].split("::", 1)[0] if picked else "",
+                (time.monotonic() - t0) * 1000,
+                r.status_code in (200, 206))
     drop = ("content-length", "content-encoding", "transfer-encoding",
             "connection", "content-security-policy")
     h = {k: v for k, v in r.headers.items() if k.lower() not in drop}
@@ -1088,6 +1166,27 @@ async def ext_source_test_all(request: Request):
                                    return_exceptions=True)
     out = [r for r in results if isinstance(r, dict)]
     return {"code": 0, "msg": "", "data": out}
+
+
+@app.post("/v/api/ext/health/run")
+async def ext_health_run(request: Request):
+    """立即体检一次（可选推送），返回报告。"""
+    import json as _json
+    body = _json.loads(await request.body() or b"{}")
+    report = await health.run_check(push=bool(body.get("push", False)))
+    return {"code": 0, "msg": "", "data": report}
+
+
+@app.get("/v/api/ext/health/report")
+async def ext_health_report():
+    st = health._load_state()
+    return {"code": 0, "msg": "", "data": st.get("last_report")}
+
+
+@app.get("/v/api/ext/seg-stats")
+async def ext_seg_stats():
+    """各源分片实测速度（EWMA 毫秒），供管理页展示/调试。"""
+    return {"code": 0, "msg": "", "data": _seg_stats}
 
 
 @app.get("/v/online-admin")

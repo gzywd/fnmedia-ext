@@ -83,6 +83,27 @@ future；后台任务随后 `set_result` 抛 `InvalidStateError` → 500 → 客
   指向要播的那一集（智能续播/进度不变）。
 - `play/info` 支持季 guid：映射回所属剧集再走智能续播。
 
+### 6. 新功能：资源站自动体检（feature 3）
+
+- 新增 `proxy/health.py`：每日定时（默认 04:10，可配）并发探测全部源，
+  pushplus 推送报告；启用的源**连续 2 次**失败自动停用（可在管理页再启用）。
+- 配置：`state/config.json` 的 `health` 键（enabled/hour/minute/fail_threshold/push）。
+- API：`POST /v/api/ext/health/run`（立即体检，body `{"push":true}` 可推送）、
+  `GET /v/api/ext/health/report`（最近报告）。
+
+### 7. 新功能：卡顿自动换线（feature 6）
+
+- 播放分片时实测各源速度（EWMA，持久化在 `state/seg_stats.json`）。
+- `play/play` 在播放器未指定线路时，自动选实测最快的源；无数据保持原线路。
+- master 播放列表按速度排序，快线给最大 BANDWIDTH（ABR 优先选中快线）。
+- API：`GET /v/api/ext/seg-stats` 查看各源实测速度。
+
+### 8. 弹幕匹配：虚拟文件名标准化（配合 danmu-api 容器）
+
+- 在线条目的 `file_name/path` 从 `在线/HD国语.m3u8` 改为
+  电影 `剧名.年份.备注.m3u8`、剧集 `剧名.S01E01.集标题.m3u8`，
+  使 dandanplay 兼容弹幕服务能按文件名正确匹配。
+
 ## 注意
 
 - 只修改 `proxy/app.py`，不动官方二进制 / nginx / 数据库，卸载扩展仍可完整还原。
