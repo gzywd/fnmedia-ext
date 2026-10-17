@@ -18,3 +18,8 @@ dist/
 .DS_Store
 .vscode/
 .idea/
+
+# Release binaries are published via GitHub Releases, not Git tree
+/release/*.fpk
+/release/*.sha256
+/release/*.sha256sum
