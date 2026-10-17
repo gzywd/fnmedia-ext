@@ -30,8 +30,8 @@ DEFAULT_SOURCES = [
     {"id": "xinlang", "name": "新狼资源", "api": "https://api.xinlangapi.com/xinlangapi.php/provide/vod/at/json", "enabled": True},
     {"id": "dytt", "name": "电影天堂", "api": "https://caiji.dyttzyapi.com/api.php/provide/vod/at/json", "enabled": True},
     {"id": "s360", "name": "360资源", "api": "https://360zy.com/api.php/provide/vod/at/json", "enabled": False},
-    # 2026-10-18 从 GitHub TVBox 配置合集中挖出并三轮实测可用的新源
-    {"id": "fh", "name": "飞花资源", "api": "http://fhapi9.com/api.php/provide/vod/at/json", "enabled": True},
+    # 2026-10-18 从 GitHub TVBox 配置合集中挖出并实测：新增蓝鲸资源。
+    # （原新增的 fhapi9"飞花资源"实为成人采集站，已彻底移除，见 FORK_CHANGES 第 11 节）
     {"id": "lj", "name": "蓝鲸资源", "api": "https://apilj.com/api.php/provide/vod/at/json", "enabled": True},
 ]
 

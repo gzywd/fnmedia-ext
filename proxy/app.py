@@ -115,6 +115,19 @@ async def lifespan(app: FastAPI):
     app.state.ext = httpx.AsyncClient(
         timeout=httpx.Timeout(30), trust_env=False, follow_redirects=True)
     _seg_load()
+    # 成人内容硬过滤：清掉历史缓存里的 NSFW 条目（含其播放记录）
+    try:
+        purged = [g for g, b in store._titles.items()
+                  if _is_nsfw(b.get("title", ""), b.get("type_name", ""))]
+        for g in purged:
+            store._titles.pop(g, None)
+            hist = history._rec.pop(g, None) if hasattr(history, "_rec") else None
+        if purged:
+            store._dirty = True
+            store._flush_locked(force=True)
+            _log.warning(f"[nsfw-purge] 清除成人缓存条目 {len(purged)} 条")
+    except Exception:
+        _log.exception("nsfw purge 失败")
     tasks = [asyncio.create_task(health.loop())]
     yield
     for t in tasks:
@@ -186,7 +199,7 @@ def _merge_items(titles: list, keyword: str = "") -> list:
     # 播放线路（供播放器「切换线路」）；过滤解说/预告/无直链。
     groups: dict[tuple, dict] = {}
     for t in titles:
-        if config.is_junk(t.title, t.remarks):
+        if config.is_junk(t.title, t.remarks) or _is_nsfw(t.title, t.type_name):
             continue
         playable = [e for line in t.sources.values() for e in line
                     if e.direct or e.resolve]
@@ -275,6 +288,18 @@ def _schedule_fill(keyword: str) -> None:
         return
     _bg_fill.add(task)  # 持有引用，避免任务被 GC
     task.add_done_callback(_bg_fill.discard)
+
+
+# ── 成人内容硬过滤（绝对禁区，不受 filter_junk 开关影响）──────────────
+# 命中标题或分类即丢弃，且启动时从已缓存条目中清除
+NSFW_RE = re.compile(
+    r"伦理|三级|福利|自拍|偷拍|写真|激情|成人|无码|巨乳|丝袜|萝莉|群交|淫|裸聊|"
+    r"欲奴|情色|色情|换爱|女优|做爱|床戏|援交|约炮|人妻|少妇|性爱|高潮|内射|"
+    r"勃起|榨精|紫薇|露出|强暴|轮奸|卖淫|嫖|妓|风月|一夜情|口交|肛交|自慰", re.I)
+
+
+def _is_nsfw(title: str = "", type_name: str = "") -> bool:
+    return bool(NSFW_RE.search(f"{title} {type_name}"))
 
 
 _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
