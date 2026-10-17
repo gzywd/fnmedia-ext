@@ -225,13 +225,25 @@ def _merge_items(titles: list, keyword: str = "") -> list:
                 g["lines"][lkey] = [e.__dict__ for e in play]
     # 排序：完全同名 → 季号升序 → 集数降序（原来是纯集数降序，剧集会乱序）
     kw = _norm_title(keyword or "")
+    _SEASON_STRIP = re.compile(
+        r"第\s*[0-9一二三四五六七八九十]{1,3}\s*[季部]|season\s*\d+", re.I)
+
     def _order(g: dict) -> tuple:
         title = g["rep"].title
+        nt = _norm_title(title)
         epn = sum(len(v) for v in g["lines"].values())
-        exact = 0 if (_norm_title(title) == kw and kw) else 1
-        # 标题越接近搜索词越靠前（正传「极限挑战第3季」> 衍生「宝藏行第3季」）
-        closeness = abs(len(_norm_title(title)) - len(kw)) if kw else 0
-        return (exact, _season_num(title), closeness, -epn, _norm_title(title))
+        # 桶排序：0=与搜索词完全同名（本传/整部大电影）
+        #         1=正传各季（去掉季号后与搜索词同名，如「极限挑战第3季」）
+        #         2=衍生/大电影/动画（宝藏行、皇家宝藏等）
+        if kw and nt == kw:
+            bucket = 0
+        elif kw and _SEASON_STRIP.sub("", nt) == kw:
+            bucket = 1
+        else:
+            bucket = 2
+        # 同桶内：季号升序，标题越贴近搜索词越前，集数多者优先
+        closeness = abs(len(nt) - len(kw)) if kw else 0
+        return (bucket, _season_num(title), closeness, -epn, nt)
     ordered = sorted(groups.values(), key=_order)[:maxn]
     briefs = []
     for g in ordered:
