@@ -39,9 +39,9 @@ from store import (store, make_guid, media_guid, video_guid, is_online_guid,
 UPSTREAM_SOCK = os.environ.get("FNMEDIA_UPSTREAM_SOCK",
                                "/var/run/trim_media_upstream.sock")
 ONLINE_PREFIX = "/v/media/online"
-_search_cache: dict[str, tuple[float, list]] = {}
-_bg_tasks: set = set()
-_search_inflight: dict[str, asyncio.Future] = {}
+_search_cache: dict[str, tuple[float, list, bool]] = {}
+_PARTIAL_TTL = 15.0   # 只抓了部分源的结果缓存时间
+_SEARCH_BUDGET = 2.0  # 在线搜索总预算（秒），留 1s 给本地响应和收尾（总时限 3s）
 CACHE_TTL = 120
 
 
@@ -116,73 +116,98 @@ async def forward_upstream(request: Request) -> Response:
 
 # ------------------------------------------------------------- 在线搜索
 
-async def online_search(keyword: str, client: httpx.AsyncClient) -> list:
+def _merge_items(titles: list) -> list:
+    """跨源同名合并 + 噪音过滤，生成注入用的搜索结果条目。"""
+    maxn = int(config.get().get("max_per_keyword", 12))
+    # 跨源同名合并：同 规范化片名+年份 聚成一个条目，每个来源各成一条
+    # 播放线路（供播放器「切换线路」）；过滤解说/预告/无直链。
+    groups: dict[tuple, dict] = {}
+    for t in titles:
+        if config.is_junk(t.title, t.remarks):
+            continue
+        playable = [e for line in t.sources.values() for e in line
+                    if e.direct or e.resolve]
+        if not playable:
+            continue
+        key = (_norm_title(t.title), t.year)
+        g = groups.get(key)
+        if g is None:
+            g = {"rep": t, "members": [], "lines": {}}
+            groups[key] = g
+        g["members"].append(t)
+        for lname, eps in t.sources.items():
+            play = [e for e in eps if e.direct or e.resolve]
+            if not play:
+                continue
+            lkey = f"{t.provider}::{lname}"
+            # 同 key 保留直链更多（更优）者；否则集数更多者
+            cur = g["lines"].get(lkey)
+            nd_new = sum(1 for e in play if e.direct)
+            nd_cur = sum(1 for e in (cur or []) if e.get("direct"))
+            if cur is None or nd_new > nd_cur or \
+                    (nd_new == nd_cur and len(play) > len(cur)):
+                g["lines"][lkey] = [e.__dict__ for e in play]
+    # 排序：按可播直链总数（跨线路）降序
+    ordered = sorted(groups.values(),
+                     key=lambda g: sum(len(v) for v in g["lines"].values()),
+                     reverse=True)[:maxn]
+    briefs = []
+    for g in ordered:
+        rep = g["rep"]
+        brief = inj.brief_of(rep)
+        brief["lines"] = g["lines"]
+        briefs.append(brief)
+    briefs = store.remember_merged(briefs)
+    return [inj.search_item(b) for b in briefs]
+
+
+async def online_search(keyword: str, budget: float = _SEARCH_BUDGET) -> list:
+    """在线搜索：最多花 budget 秒，查到多少返回多少，慢源直接放弃。"""
     now = time.time()
-    if keyword in _search_cache and now - _search_cache[keyword][0] < CACHE_TTL:
-        return _search_cache[keyword][1]
-    fut = _search_inflight.get(keyword)
-    if fut is None:
-        fut = asyncio.get_event_loop().create_future()
-        _search_inflight[keyword] = fut
+    hit = _search_cache.get(keyword)
+    if hit:
+        ts, items, complete = hit
+        if now - ts < (CACHE_TTL if complete else _PARTIAL_TTL):
+            return items
+    sources = config.enabled_sources()
+    titles, complete = await providers.search_all(keyword, sources,
+                                                  timeout=budget)
+    items = _merge_items(titles)
+    if complete or items:
+        _search_cache[keyword] = (time.time(), items, complete)
+    if not complete:
+        _schedule_fill(keyword)
+    return items
 
-        async def work():
-            try:
-                sources = config.enabled_sources()
-                titles = await providers.search_all(keyword, sources)
-                maxn = int(config.get().get("max_per_keyword", 12))
-                src_name = {s["id"]: s.get("name", s["id"])
-                            for s in config.all_sources()}
-                # 跨源同名合并：同 规范化片名+年份 聚成一个条目，每个来源各成一条
-                # 播放线路（供播放器「切换线路」）；过滤解说/预告/无直链。
-                groups: dict[tuple, dict] = {}
-                for t in titles:
-                    if config.is_junk(t.title, t.remarks):
-                        continue
-                    playable = [e for line in t.sources.values() for e in line
-                                if e.direct or e.resolve]
-                    if not playable:
-                        continue
-                    key = (_norm_title(t.title), t.year)
-                    g = groups.get(key)
-                    if g is None:
-                        g = {"rep": t, "members": [], "lines": {}}
-                        groups[key] = g
-                    g["members"].append(t)
-                    for lname, eps in t.sources.items():
-                        play = [e for e in eps if e.direct or e.resolve]
-                        if not play:
-                            continue
-                        lkey = f"{t.provider}::{lname}"
-                        # 同 key 保留直链更多（更优）者；否则集数更多者
-                        cur = g["lines"].get(lkey)
-                        nd_new = sum(1 for e in play if e.direct)
-                        nd_cur = sum(1 for e in (cur or []) if e.get("direct"))
-                        if cur is None or nd_new > nd_cur or \
-                                (nd_new == nd_cur and len(play) > len(cur)):
-                            g["lines"][lkey] = [e.__dict__ for e in play]
-                # 排序：按可播直链总数（跨线路）降序
-                ordered = sorted(groups.values(),
-                                 key=lambda g: sum(len(v) for v in g["lines"].values()),
-                                 reverse=True)[:maxn]
-                briefs = []
-                for g in ordered:
-                    rep = g["rep"]
-                    brief = inj.brief_of(rep)
-                    brief["lines"] = g["lines"]
-                    briefs.append(brief)
-                briefs = store.remember_merged(briefs)
-                items = [inj.search_item(b) for b in briefs]
-                _search_cache[keyword] = (time.time(), items)
-                if not fut.done():
-                    fut.set_result(items)
-            except Exception as exc:
-                if not fut.done():
-                    fut.set_result([])
-            finally:
-                _search_inflight.pop(keyword, None)
 
-        asyncio.create_task(work())
-    return await fut
+_bg_fill: set = set()
+
+
+def _schedule_fill(keyword: str) -> None:
+    """这次没抓全：后台把剩下的源跑完，下次搜索直接吃完整缓存。"""
+    if keyword in _bg_fill:
+        return
+    _bg_fill.add(keyword)
+
+    async def work():
+        try:
+            titles, complete = await providers.search_all(
+                keyword, config.enabled_sources(), timeout=15.0)
+            if complete:
+                items = _merge_items(titles)
+                _search_cache[keyword] = (time.time(), items, True)
+        except Exception:
+            pass
+        finally:
+            _bg_fill.discard(keyword)
+
+    try:
+        task = asyncio.create_task(work())
+    except RuntimeError:
+        _bg_fill.discard(keyword)
+        return
+    _bg_fill.add(task)  # 持有引用，避免任务被 GC
+    task.add_done_callback(_bg_fill.discard)
 
 
 def _norm_title(t: str) -> str:
@@ -218,6 +243,7 @@ def _should_online(q: str) -> bool:
 
 @app.get("/v/api/v1/search/list")
 async def search_list(request: Request):
+    t0 = time.time()
     local = await forward_upstream(request)
     q = request.query_params.get("q", "").strip()
     try:
@@ -232,20 +258,14 @@ async def search_list(request: Request):
         items = []
     online = []
     if q and _should_online(q):
-        cached = _search_cache.get(q)
-        online = cached[1] if cached else []
-        fresh = bool(cached) and time.time() - cached[0] < CACHE_TTL
-        if not fresh:
-            # 不让首屏等在线：最多等 0.4s，其余后台继续抓，下次搜索直接用缓存
-            task = asyncio.create_task(online_search(q, ext_client(request)))
-            _bg_tasks.add(task)
-            task.add_done_callback(_bg_tasks.discard)
-            try:
-                online = await asyncio.wait_for(asyncio.shield(task), timeout=0.4)
-            except asyncio.TimeoutError:
-                pass
-            except Exception:
-                pass
+        # 硬性时间盒：本地 + 在线合计不超过 3 秒，到点查到什么返回什么
+        budget = max(0.3, _SEARCH_BUDGET - (time.time() - t0))
+        try:
+            # 超时由 search_all 内部兜住，这里不再套 wait_for，避免把
+            # 已经抓到一半的结果整个取消掉
+            online = await online_search(q, budget)
+        except Exception:
+            online = []
     # 在线片库更齐全，默认把在线结果排到前面；可在管理页关闭
     if config.get().get("online_first", True):
         data["data"] = online + items

@@ -8,6 +8,8 @@ provider 只负责"搜索→条目→播放 URL 列表"，不做转码。
 """
 from __future__ import annotations
 
+import asyncio
+
 import re
 import time
 import urllib.parse
@@ -254,18 +256,39 @@ async def probe_source(api: str, keyword: str = "庆余年",
             "count": len(lst), "direct": direct, "sample": sample, "error": ""}
 
 
-async def search_all(keyword: str, sources=None) -> list[OnlineTitle]:
+async def search_all(keyword: str, sources=None, timeout: float | None = None):
+    """并发搜索所有启用源。
+
+    timeout=None 时等全部完成；否则到点立刻返回已完成部分（complete=False），
+    未完成的请求直接取消，避免拖住搜索首屏。
+    返回 (titles, complete)。
+    """
     sources = sources or DEFAULT_SOURCES
     enabled = [s for s in sources if s.get("enabled")]
+    if not enabled:
+        return [], True
     async with httpx.AsyncClient(follow_redirects=True, trust_env=False) as client:
-        results = await __import__("asyncio").gather(
-            *[search_source(client, s, keyword) for s in enabled],
-            return_exceptions=True)
+        tasks = [asyncio.create_task(search_source(client, s, keyword))
+                 for s in enabled]
+        complete = True
+        if timeout is None:
+            done, pending = await asyncio.wait(tasks)
+        else:
+            done, pending = await asyncio.wait(tasks, timeout=timeout)
+            if pending:
+                complete = False
+                for t in pending:
+                    t.cancel()
+                await asyncio.wait(pending, timeout=0.01)
     titles: list[OnlineTitle] = []
-    for r in results:
+    for t in done:
+        try:
+            r = t.result()
+        except Exception:
+            continue
         if isinstance(r, list):
             titles.extend(r)
-    return titles
+    return titles, complete
 
 
 def detail_source(source: dict, vod_id: str) -> OnlineTitle | None:
