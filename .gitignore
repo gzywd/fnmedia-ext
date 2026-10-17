@@ -1,0 +1,20 @@
+# Runtime state and local private cache
+/state/
+/logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local tooling/build intermediates
+.tools/
+packaging/fpk/.build/
+dist/
+
+# Editor/OS
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,19 @@
+[Unit]
+Description=fnmedia-ext 在线资源扩展（trim_media.sock 可逆接管）
+After=network.target
+After=trim-media.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@ROOT@/proxy
+ExecStart=@ROOT@/.venv/bin/python supervise.py
+KillMode=mixed
+TimeoutStopSec=25
+Restart=no
+UMask=0022
+Environment=PYTHONUNBUFFERED=1
+Environment=FNMEDIA_UPSTREAM_SOCK=/var/run/trim_media_upstream.sock
+
+[Install]
+WantedBy=multi-user.target

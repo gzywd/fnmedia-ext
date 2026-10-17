@@ -1,0 +1,6 @@
+#!/bin/bash
+# 落盘前硬前置检查。
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "${SELF_DIR}/_common"
+[ -S /var/run/trim_media.sock ] || fnmedia_fail "未检测到官方\"飞牛影视\"：请先安装并启动飞牛影视"
+command -v python3 >/dev/null 2>&1 || fnmedia_fail "需要 python3"
+exit 0

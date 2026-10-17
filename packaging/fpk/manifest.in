@@ -1,0 +1,14 @@
+appname               = fnmedia-ext
+version               = @VERSION@
+display_name          = 飞牛影视在线扩展
+desc                  = 飞牛影视第三方在线资源扩展：零侵入可逆接管官方影视入口，在原生搜索中聚合苹果CMS资源站在线影视，点开即播（代理 m3u8/mp4），支持多线路切换、源开关、噪音过滤、播放记录与智能续播，内置应用内管理页。
+platform              = all
+source                = thirdparty
+maintainer            = yujian0815
+maintainer_url        = https://github.com/yujian0815/fnmedia-ext
+os_min_version        = 1.2.0
+install_dep_apps      = trim.media
+desktop_uidir         = ui
+desktop_applaunchname = fnmedia-ext.main
+checkport             = false
+micro_app             = true
