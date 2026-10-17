@@ -905,6 +905,7 @@ _PROVIDER_CN = {
     "baofeng": "暴风", "ffzy": "非凡", "lzi": "量子", "wujin": "无尽",
     "youku": "优酷", "guangsu": "光速", "ruyi": "如意", "jisu": "极速",
     "xinlang": "新狼", "dytt": "电影天堂", "s360": "360",
+    "fh": "飞花", "lj": "蓝鲸",
 }
 _GROUP_CN = {"m3u8": "主线路", "yun": "云播", "ff": "非凡", "uk": "优酷",
              "gs": "光速", "bf": "暴风", "lz": "量子"}

@@ -104,6 +104,15 @@ future；后台任务随后 `set_result` 抛 `InvalidStateError` → 500 → 客
   电影 `剧名.年份.备注.m3u8`、剧集 `剧名.S01E01.集标题.m3u8`，
   使 dandanplay 兼容弹幕服务能按文件名正确匹配。
 
+### 9. 新增资源源（2026-10-18，来源 GitHub TVBox 配置合集）
+
+- 从 GitHub 上多个 TVBox/苹果CMS 采集配置合集提取 131 个候选接口，
+  三轮实测（搜索「庆余年/战狼」，校验 m3u8 直链）后新增 2 个稳定源：
+  - 飞花资源 `http://fhapi9.com/api.php/provide/vod/at/json`（三轮全过，双关键词 2/2）
+  - 蓝鲸资源 `https://apilj.com/api.php/provide/vod/at/json`（可用，体检自动考核）
+- 其余候选绝大多数已失效或极不稳定（红牛/速播/lbapi9/huyaapi 等复核 0-1/2），未采用。
+- 新源可在管理页停用；连续失败也会被自动体检停用。
+
 ## 注意
 
 - 只修改 `proxy/app.py`，不动官方二进制 / nginx / 数据库，卸载扩展仍可完整还原。
