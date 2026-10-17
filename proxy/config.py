@@ -23,7 +23,7 @@ DEFAULTS = {
     "sources": [dict(s) for s in DEFAULT_SOURCES],
     # 被删除的内置源 id（自定义源删除时直接从 sources 移除）
     "removed_ids": [],
-    "max_per_keyword": 12,
+    "max_per_keyword": 16,
     "filter_junk": True,
     "junk_keywords": JUNK_KEYWORDS,
     # 在线资源前排展示（在线片库更齐全，默认前排）

@@ -229,7 +229,9 @@ def _merge_items(titles: list, keyword: str = "") -> list:
         title = g["rep"].title
         epn = sum(len(v) for v in g["lines"].values())
         exact = 0 if (_norm_title(title) == kw and kw) else 1
-        return (exact, _season_num(title), -epn, _norm_title(title))
+        # 标题越接近搜索词越靠前（正传「极限挑战第3季」> 衍生「宝藏行第3季」）
+        closeness = abs(len(_norm_title(title)) - len(kw)) if kw else 0
+        return (exact, _season_num(title), closeness, -epn, _norm_title(title))
     ordered = sorted(groups.values(), key=_order)[:maxn]
     briefs = []
     for g in ordered:
