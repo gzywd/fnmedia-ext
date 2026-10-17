@@ -40,6 +40,7 @@ UPSTREAM_SOCK = os.environ.get("FNMEDIA_UPSTREAM_SOCK",
                                "/var/run/trim_media_upstream.sock")
 ONLINE_PREFIX = "/v/media/online"
 _search_cache: dict[str, tuple[float, list]] = {}
+_bg_tasks: set = set()
 _search_inflight: dict[str, asyncio.Future] = {}
 CACHE_TTL = 120
 
@@ -172,9 +173,11 @@ async def online_search(keyword: str, client: httpx.AsyncClient) -> list:
                 briefs = store.remember_merged(briefs)
                 items = [inj.search_item(b) for b in briefs]
                 _search_cache[keyword] = (time.time(), items)
-                fut.set_result(items)
+                if not fut.done():
+                    fut.set_result(items)
             except Exception as exc:
-                fut.set_result([])
+                if not fut.done():
+                    fut.set_result([])
             finally:
                 _search_inflight.pop(keyword, None)
 
@@ -229,13 +232,20 @@ async def search_list(request: Request):
         items = []
     online = []
     if q and _should_online(q):
-        try:
-            online = await asyncio.wait_for(online_search(q, ext_client(request)),
-                                            timeout=6.0)
-        except asyncio.TimeoutError:
-            online = []
-        except Exception:
-            online = []
+        cached = _search_cache.get(q)
+        online = cached[1] if cached else []
+        fresh = bool(cached) and time.time() - cached[0] < CACHE_TTL
+        if not fresh:
+            # 不让首屏等在线：最多等 0.4s，其余后台继续抓，下次搜索直接用缓存
+            task = asyncio.create_task(online_search(q, ext_client(request)))
+            _bg_tasks.add(task)
+            task.add_done_callback(_bg_tasks.discard)
+            try:
+                online = await asyncio.wait_for(asyncio.shield(task), timeout=0.4)
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
     # 在线片库更齐全，默认把在线结果排到前面；可在管理页关闭
     if config.get().get("online_first", True):
         data["data"] = online + items
@@ -542,6 +552,38 @@ async def direct_proxy(mg: str, request: Request):
 
     return StreamingResponse(pump(), status_code=r.status_code, headers=h,
                              media_type=r.headers.get("content-type", "video/mp4"))
+
+
+@app.get("/v/api/v1/media/range/{mg}")
+async def media_range(mg: str, request: Request):
+    """iOS/移动端播放器直接拉取 media_guid 字节时走这里：
+    在线条目无本地文件，改为返回本代理的 HLS 播放列表（绝对路径）。"""
+    target = store.resolve_media_guid(mg)
+    if not target:
+        return await forward_upstream(request)
+    await _resolve_if_needed(target, request)
+    src_url = target.get("url", "")
+    q = urllib.parse.urlencode({"line": target.get("line", ""),
+                                "index": target.get("index", 0)})
+    if re.search(r"\.m3u8(\?|$)", src_url, re.I):
+        master = ("#EXTM3U\n#EXT-X-VERSION:3\n"
+                  "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080\n"
+                  f"{ONLINE_PREFIX}/{mg}/main.m3u8?{q}\n")
+        return Response(master, media_type="application/vnd.apple.mpegurl",
+                        headers={"Cache-Control": "no-cache",
+                                 "Access-Control-Allow-Origin": "*"})
+    return RedirectResponse(f"{ONLINE_PREFIX}/{mg}/direct?{q}", status_code=302)
+
+
+@app.get("/v/api/v1/media/range/{mg}/{sub:path}")
+async def media_range_sub(mg: str, request: Request):
+    """同上的子路径（播放列表相对请求）兜底。"""
+    if not store.resolve_media_guid(mg):
+        return await forward_upstream(request)
+    url = f"{ONLINE_PREFIX}/{mg}/{sub}"
+    if request.url.query:
+        url += "?" + request.url.query
+    return RedirectResponse(url, status_code=302)
 
 
 def vg_for(mg: str) -> str:
