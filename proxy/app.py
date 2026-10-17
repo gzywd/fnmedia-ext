@@ -175,8 +175,12 @@ async def forward_upstream(request: Request) -> Response:
 
 # ------------------------------------------------------------- 在线搜索
 
-def _merge_items(titles: list) -> list:
-    """跨源同名合并 + 噪音过滤，生成注入用的搜索结果条目。"""
+def _merge_items(titles: list, keyword: str = "") -> list:
+    """跨源同名合并 + 噪音过滤，生成注入用的搜索结果条目。
+
+    排序：与关键词完全同名（且无季号，即本传/整部）最前 →
+    按季号升序（第1季、第2季…）→ 同季按可播集数降序 → 标题字典序。
+    """
     maxn = int(config.get().get("max_per_keyword", 12))
     # 跨源同名合并：同 规范化片名+年份 聚成一个条目，每个来源各成一条
     # 播放线路（供播放器「切换线路」）；过滤解说/预告/无直链。
@@ -206,10 +210,14 @@ def _merge_items(titles: list) -> list:
             if cur is None or nd_new > nd_cur or \
                     (nd_new == nd_cur and len(play) > len(cur)):
                 g["lines"][lkey] = [e.__dict__ for e in play]
-    # 排序：按可播直链总数（跨线路）降序
-    ordered = sorted(groups.values(),
-                     key=lambda g: sum(len(v) for v in g["lines"].values()),
-                     reverse=True)[:maxn]
+    # 排序：完全同名 → 季号升序 → 集数降序（原来是纯集数降序，剧集会乱序）
+    kw = _norm_title(keyword or "")
+    def _order(g: dict) -> tuple:
+        title = g["rep"].title
+        epn = sum(len(v) for v in g["lines"].values())
+        exact = 0 if (_norm_title(title) == kw and kw) else 1
+        return (exact, _season_num(title), -epn, _norm_title(title))
+    ordered = sorted(groups.values(), key=_order)[:maxn]
     briefs = []
     for g in ordered:
         rep = g["rep"]
@@ -231,7 +239,7 @@ async def online_search(keyword: str, budget: float = _SEARCH_BUDGET) -> list:
     sources = config.enabled_sources()
     titles, complete = await providers.search_all(keyword, sources,
                                                   timeout=budget)
-    items = _merge_items(titles)
+    items = _merge_items(titles, keyword)
     if complete or items:
         _search_cache[keyword] = (time.time(), items, complete)
     if not complete:
@@ -253,7 +261,7 @@ def _schedule_fill(keyword: str) -> None:
             titles, complete = await providers.search_all(
                 keyword, config.enabled_sources(), timeout=15.0)
             if complete:
-                items = _merge_items(titles)
+                items = _merge_items(titles, keyword)
                 _search_cache[keyword] = (time.time(), items, True)
         except Exception:
             pass
@@ -269,9 +277,41 @@ def _schedule_fill(keyword: str) -> None:
     task.add_done_callback(_bg_fill.discard)
 
 
+_CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
+           "八": 8, "九": 9}
+
+
+def _cn2num(s: str) -> int:
+    """中文数字（一~九十九）转阿拉伯数字；已是数字直接转。"""
+    s = (s or "").strip()
+    if s.isdigit():
+        return int(s)
+    if "十" in s:
+        a, _, b = s.partition("十")
+        return _CN_NUM.get(a, 1) * 10 + (_CN_NUM.get(b, 0) if b else 0)
+    return _CN_NUM.get(s, 0)
+
+
+_SEASON_RE = re.compile(r"第\s*([0-9]+|[一二三四五六七八九十]{1,3})\s*[季部]|season\s*(\d+)",
+                        re.I)
+
+
+def _season_num(title: str) -> int:
+    """从标题提取季号：第X季/第X部/Season X；无季号返回 0（本传/整部）。"""
+    m = _SEASON_RE.search(title or "")
+    if not m:
+        return 0
+    return _cn2num(m.group(1)) if m.group(1) else int(m.group(2))
+
+
 def _norm_title(t: str) -> str:
     """跨源同名归并的片名规范化：去空白/标点/常见后缀，便于把不同站的同一部片聚到一起。"""
     t = (t or "").strip().lower()
+    # 中文季号先统一成阿拉伯数字（第一季/第1季/Season 1 → 第1季），
+    # 这样不同源的同一季才能聚到一个条目
+    t = re.sub(r"第\s*([一二三四五六七八九十]{1,3})\s*季",
+               lambda m: f"第{_cn2num(m.group(1))}季", t)
+    t = re.sub(r"season\s*(\d+)", lambda m: f"第{m.group(1)}季", t, flags=re.I)
     # 去掉空格与常见分隔标点
     t = re.sub(r"[\s·・:：,，.。!！?？'’\"\-—_()（）\[\]【】]+", "", t)
     # 去掉年份尾缀（年份单独作为合并键）
