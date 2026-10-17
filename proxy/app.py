@@ -380,6 +380,13 @@ async def play_info(request: Request):
         return JSONResponse({"code": 0, "msg": "", "data": info})
     brief = store.get_title_by_guid(guid)
     if not brief:
+        # 季 guid 也可能被当播放键：映射回所属剧集
+        for _og in list(store._titles):
+            if season_guid(_og) == guid:
+                brief = store.get_title_by_guid(_og)
+                guid = _og
+                break
+    if not brief:
         return await forward_upstream(request)
     # 多集（TV）：标题播放键 → 智能续播（没看过=第1集；看过未看完=该集+进度；
     # 已看完=下一集）。返回该集的 play info，后续 stream/play 都按集走。
@@ -392,6 +399,14 @@ async def play_info(request: Request):
                 if ep:
                     info = inj.episode_play_info(ep)
                     info["ts"] = resume_ts
+                    # 客户端是拿「点进来的 guid」去校验的：保持 guid/type/item 与请求一致，
+                    # 只把 media/video 指向要播的那一集（续播逻辑不变）。
+                    # 否则 iOS 会认为条目已被移动/删除，弹「文件不存在」。
+                    info["guid"] = guid
+                    info["type"] = "TV"
+                    info["parent_guid"] = ""
+                    info["grand_guid"] = guid
+                    info["item"] = inj.detail_item(brief)
                     return JSONResponse({"code": 0, "msg": "", "data": info})
     info = inj.play_info(brief)
     if rec:

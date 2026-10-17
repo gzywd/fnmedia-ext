@@ -70,6 +70,19 @@ future；后台任务随后 `set_result` 抛 `InvalidStateError` → 500 → 客
    原逻辑只看 `media_guid`，空值直接透传官方 → 官方找不到该文件。
    现改为 `media_guid or video_guid` 兜底。
 
+### 5. 剧集页大按钮修好后仍报「文件不存在」（play/info 条目一致性）
+
+**原因**：客户端会拿「点进来的 guid」校验播放信息。
+- 旧逻辑对 TV 返回的是 `Episode` 的 guid/type/item，与请求的 TV guid 对不上，
+  App 判定条目被移动/删除，直接弹「文件不存在」，后续播放请求根本不发生。
+- 部分场景还会拿「季 guid」当播放键，旧逻辑不认识季 guid，直接透传官方 → 失败。
+
+**改动**：
+
+- `play/info` 对 TV：保持 `guid/type/item` 与请求一致（TV），只把 `media/video guid`
+  指向要播的那一集（智能续播/进度不变）。
+- `play/info` 支持季 guid：映射回所属剧集再走智能续播。
+
 ## 注意
 
 - 只修改 `proxy/app.py`，不动官方二进制 / nginx / 数据库，卸载扩展仍可完整还原。
