@@ -57,6 +57,19 @@ future；后台任务随后 `set_result` 抛 `InvalidStateError` → 500 → 客
 - 用 `asyncio.shield(task)` 保护后台任务，超时不再取消。
 - `set_result` 前检查 `fut.done()`。
 
+### 4. 标题页「第 1 集」大按钮提示「文件不存在」
+
+**现象**：剧集/综艺详情页点顶部大播放键报「文件不存在」，点下方选集里的同一集却能播。
+
+**原因**（两处，都在 `proxy/app.py`）：
+
+1. `stream/list` 对非 TV 条目调用 `store.media_guid(guid)`，而 `media_guid` 是模块级函数，
+   `Store` 上没有这个方法 → AttributeError → 500 → 客户端报「文件不存在」。
+   改成 `media_guid(guid)`。
+2. 播放器有时请求 `play/play`、`stream` 时只带 `video_guid`、`media_guid` 留空；
+   原逻辑只看 `media_guid`，空值直接透传官方 → 官方找不到该文件。
+   现改为 `media_guid or video_guid` 兜底。
+
 ## 注意
 
 - 只修改 `proxy/app.py`，不动官方二进制 / nginx / 数据库，卸载扩展仍可完整还原。

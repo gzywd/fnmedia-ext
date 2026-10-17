@@ -356,7 +356,7 @@ async def stream_list(guid: str, request: Request):
             if egs:
                 target = store.get_episode_target(egs[0])
         else:
-            target = store.resolve_media_guid(store.media_guid(guid))
+            target = store.resolve_media_guid(media_guid(guid))
     quals = _qualities(target) if target else []
     if quals:
         sl["video_streams"][0]["resolution_type"] = quals[0]["resolution"]
@@ -469,7 +469,8 @@ def _qualities(target: dict) -> list[dict]:
 async def stream_post(request: Request):
     import json
     body = json.loads(await request.body() or b"{}")
-    mg = body.get("media_guid", "")
+    # 播放器有时只带 video_guid（如剧集标题页的「第 1 集」按钮）
+    mg = body.get("media_guid") or body.get("video_guid") or ""
     target = store.resolve_media_guid(mg)
     if not target:
         return await forward_upstream(request)
@@ -495,7 +496,8 @@ async def stream_post(request: Request):
 async def play_play(request: Request):
     import json
     body = json.loads(await request.body() or b"{}")
-    mg = body.get("media_guid", "")
+    # 只在 media_guid 为空时用 video_guid 兜底（标题页大播放键走这条）
+    mg = body.get("media_guid") or body.get("video_guid") or ""
     base_target = store.resolve_media_guid(mg)
     if not base_target:
         return await forward_upstream(request)
