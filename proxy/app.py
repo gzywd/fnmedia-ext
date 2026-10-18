@@ -749,6 +749,12 @@ async def search_list(request: Request):
     items = data.get("data")
     if not isinstance(items, list):
         items = []
+    # 用户指定：搜索结果里去掉豆瓣仓库（榜单墙）的本地条目，
+    # 只留本地真实影片 + 在线资源。条目自带所属媒体库名（ancestor_name），
+    # 墙条目库名均含"豆瓣"，以此识别最可靠。
+    if items:
+        items = [it for it in items if not (
+            isinstance(it, dict) and "豆瓣" in (it.get("ancestor_name") or ""))]
     online = []
     if q and _should_online(q):
         # 硬性时间盒：本地 + 在线合计不超过 3 秒，到点查到什么返回什么
