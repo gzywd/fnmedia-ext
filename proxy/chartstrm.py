@@ -116,8 +116,12 @@ def sync_strm() -> dict:
             title = _safe(ent.get("title", ""))
             year = (ent.get("year") or "").strip()
             guid = _guid_of(key, ent)
-            n_titles += 1
             og, egs = _resolved_tv(key, guid) if is_tv else (None, [])
+            if is_tv and len(egs) <= 1:
+                # 用户指定：剧集/综艺没解析出多集的（缺集少集）不上墙，
+                # 等每周重搜拿到完整资源后自动出现
+                continue
+            n_titles += 1
             stem = f"{title} ({year})" if year else title
             if is_tv and len(egs) > 1:
                 # ---- 剧集结构：每集一个 strm ----
