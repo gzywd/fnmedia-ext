@@ -172,6 +172,12 @@ def main():
             [str(PY), str(PROXY / "webui_gateway.py"), str(BASE), str(TARGET)],
             cwd=str(PROXY), env=env)
 
+        # TCP 中继 0.0.0.0:18930 -> trim_media.sock：豆瓣仓库 strm 直连播放。
+        # 应用层白名单（仅播放相关路径）由 app 中间件负责。
+        relay = subprocess.Popen(
+            [str(PY), str(PROXY / "tcp_relay.py"), str(TARGET)],
+            cwd=str(PROXY), env=env)
+
         # 捕获停止信号：先退出子进程再回滚
         stopping = {"v": False}
 
@@ -189,6 +195,11 @@ def main():
                 log(f"桌面网关异常退出 rc={gw.returncode}，重启")
                 gw = subprocess.Popen(
                     [str(PY), str(PROXY / "webui_gateway.py"), str(BASE), str(TARGET)],
+                    cwd=str(PROXY), env=env)
+            if relay.poll() is not None:
+                log(f"TCP 中继异常退出 rc={relay.returncode}，重启")
+                relay = subprocess.Popen(
+                    [str(PY), str(PROXY / "tcp_relay.py"), str(TARGET)],
                     cwd=str(PROXY), env=env)
             time.sleep(1)
     finally:
@@ -208,6 +219,8 @@ def main():
                 gw.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 gw.kill()
+        if 'relay' in locals() and relay.poll() is None:
+            relay.terminate()
         if child.poll() is None:
             child.terminate()
             try:

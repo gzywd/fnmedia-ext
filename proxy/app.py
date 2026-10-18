@@ -430,8 +430,10 @@ def _chart_load() -> None:
         j = json.loads(_CHART_STATE.read_text())
         _chart_items = j.get("items", {})
         _chart_map = j.get("map", {})
-    except Exception:
+        _log.warning(f"[charts] 启动加载 items={len(_chart_items)} map={len(_chart_map)}")
+    except Exception as _e:
         _chart_items, _chart_map = {}, {}
+        _log.warning(f"[charts] 启动加载失败: {type(_e).__name__}: {_e}")
 
 
 def _chart_flush() -> None:
@@ -580,8 +582,7 @@ async def _chart_resolve(guid: str) -> str:
 
 
 def _charts_loop_factory():
-    async def _charts_loop():
-        # 启动稍等片刻再校验榜单缓存；之后每 7 天刷一次
+    async def _charts_loop():        # 启动稍等片刻再校验榜单缓存；之后每 7 天刷一次
         await asyncio.sleep(30)
         while True:
             try:
@@ -594,12 +595,47 @@ def _charts_loop_factory():
                     r = await charts.refresh_all()
                     _log.warning(f"[charts] 定时刷新 ok={r.get('ok')} "
                                  f"{({k: v.get('count') for k, v in r.get('stats', {}).items()})}")
+                # 榜单落成 strm 文件（豆瓣仓库影视墙），幂等
+                try:
+                    import chartstrm
+                    st = chartstrm.sync_strm()
+                    _log.warning("[charts] strm 同步 " +
+                                 " ".join(f"{k}={v['count']}" for k, v in st.items()))
+                except Exception:
+                    _log.exception("[charts] strm 同步失败")
             except Exception:
                 _log.exception("[charts] 刷新失败")
                 await asyncio.sleep(3600)
                 continue
             await asyncio.sleep(7 * 86400)
     return _charts_loop
+
+
+@app.get("/chartplay/{guid}.m3u8")
+@app.get("/chartplay/{guid}")
+async def chartplay(guid: str, request: Request):
+    """strm 直连播放入口：豆瓣仓库里的 strm 文件指向这里。
+
+    解析榜单条目 -> 电影取正片 / 剧集取智能续播集 -> 302 到 HLS preset
+    （多线路呈现为可切换线路，后续分片全部走既有 HLS 代理）。
+    """
+    # 装饰器自下而上注册，通配路由先命中，guid 会带上 .m3u8 后缀
+    guid = guid.removesuffix(".m3u8")
+    real = await _chart_resolve(guid)
+    if not real:
+        return Response("no playable resource", status_code=404)
+    mg = ""
+    brief = store.get_title_by_guid(real)
+    if brief and inj.is_tv(brief):
+        egs = store.tv_episode_guids(real)
+        if egs:
+            target_eg, _ts = history.resume_episode(egs)
+            mg = ep_media_guid(target_eg or egs[0])
+    if not mg:
+        mg = media_guid(real)
+    base = str(request.base_url).rstrip("/")
+    return RedirectResponse(f"{base}{ONLINE_PREFIX}/{mg}/preset.m3u8",
+                            status_code=302)
 
 
 @app.get("/v/api/v1/search/list")
@@ -1684,6 +1720,8 @@ async def ext_charts_refresh():
             import charts
             r = await charts.refresh_all(force=True)
             _log.warning(f"[charts] 手动刷新 ok={r.get('ok')}")
+            import chartstrm
+            chartstrm.sync_strm()
         except Exception:
             _log.exception("[charts] 手动刷新失败")
     asyncio.create_task(_run())
