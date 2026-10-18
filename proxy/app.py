@@ -28,6 +28,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import (JSONResponse, RedirectResponse,
                                StreamingResponse)
+from starlette.background import BackgroundTask
 
 import providers
 import health
@@ -184,7 +185,11 @@ def ext_client(req: Request) -> httpx.AsyncClient:
 
 
 async def forward_upstream(request: Request) -> Response:
-    """原样透传官方后端（走 unix socket）。"""
+    """原样透传官方后端（走 unix socket）。
+
+    大响应/流式内容（本地播放的 media/range 视频分片等）边收边发，
+    不在进程内整块缓冲——否则播本地片时内存随分片暴涨（历史 5G+ 泄漏根因）。
+    """
     client = up_client(request)
     url = "http://localhost" + request.url.path
     if request.url.query:
@@ -193,17 +198,29 @@ async def forward_upstream(request: Request) -> Response:
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("connection", "content-length", "host")}
     headers["Host"] = "localhost"
+    req = client.build_request(request.method, url, headers=headers, content=body)
     try:
-        r = await client.request(request.method, url, headers=headers, content=body)
+        r = await client.send(req, stream=True)
     except Exception as exc:
         return JSONResponse({"code": -1, "msg": f"upstream {type(exc).__name__}", "data": None},
                             status_code=502)
+    ctype = (r.headers.get("content-type") or "").lower()
+    clength = int(r.headers.get("content-length") or 0)
     resp_headers = {k: v for k, v in r.headers.items()
                     if k.lower() not in ("content-length", "content-encoding",
                                          "transfer-encoding", "connection")}
-    return Response(content=r.content, status_code=r.status_code,
-                    headers=resp_headers,
-                    media_type=r.headers.get("content-type"))
+    # JSON/小响应：整块读出（调用方普遍依赖返回值 .body 解析）
+    if "json" in ctype or (0 < clength <= 1_000_000) or request.method == "HEAD":
+        content = await r.aread()
+        await r.aclose()
+        return Response(content=content, status_code=r.status_code,
+                        headers=resp_headers,
+                        media_type=r.headers.get("content-type"))
+    # 大响应/未知长度流：直接透传字节流
+    return StreamingResponse(
+        r.aiter_raw(), status_code=r.status_code, headers=resp_headers,
+        media_type=r.headers.get("content-type"),
+        background=BackgroundTask(r.aclose))
 
 
 # ------------------------------------------------------------- 在线搜索
