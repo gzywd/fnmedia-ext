@@ -90,11 +90,13 @@ def _seg_record(provider: str, ms: float, ok: bool) -> None:
 
 
 def _speed_rank(provider: str) -> float:
-    """线路排序键：越小越快。没实测过的给中性值，排在中游。"""
+    """线路排序键：越小越快。没实测过的给中性值，排在中游。
+    AES 加密线路被飞牛播放器拒绝（HTTP 错误），重罚排到最后。"""
     st = _seg_stats.get(provider)
     if not st:
         return 2000.0
-    return float(st.get("ewma_ms", 2000)) + int(st.get("fails", 0)) * 800
+    penalty = 50000 if st.get("encrypted") else 0
+    return penalty + float(st.get("ewma_ms", 2000)) + int(st.get("fails", 0)) * 800
 _PARTIAL_TTL = 15.0   # 只抓了部分源的结果缓存时间
 _SEARCH_BUDGET = 2.5  # 在线搜索总预算（秒），用户 2026-10-18 指定：用满 3 秒上限换更全结果
 CACHE_TTL = 120
@@ -1075,6 +1077,17 @@ async def hls_main(mg: str, request: Request):
         if not nxt or nxt == cur:
             break
         cur = nxt
+    # AES-128 加密 HLS：飞牛播放器兼容性差（报 HTTP 错误），打上标记，
+    # 自动选线时把这类线路排到最后（全部都加密时仍可用）
+    if re.search(r"#EXT-X-KEY:METHOD=(?!NONE)[A-Za-z0-9-]+", text):
+        provider = (picked.get("line") or "").split("::", 1)[0]
+        if provider:
+            st = _seg_stats.setdefault(
+                provider, {"ewma_ms": 2000.0, "n": 0, "fails": 0, "last": 0.0})
+            if not st.get("encrypted"):
+                st["encrypted"] = 1
+                _seg_flush()
+            _log.warning(f"[line] {provider} 为 AES 加密 HLS，自动选线将回避")
     base_url = cur  # 分片相对地址以最终媒体列表为基准
 
     sel_qs = ""
