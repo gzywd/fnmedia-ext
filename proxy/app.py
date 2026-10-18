@@ -43,6 +43,7 @@ UPSTREAM_SOCK = os.environ.get("FNMEDIA_UPSTREAM_SOCK",
                                "/var/run/trim_media_upstream.sock")
 ONLINE_PREFIX = "/v/media/online"
 _search_cache: dict[str, tuple[float, list, bool]] = {}
+_search_inflight: dict[str, asyncio.Future] = {}
 # 线路速度统计：provider -> {ewma_ms, n, fails, last}（分片实测，卡顿自动换线用）
 _SEG_STATE = Path(__file__).resolve().parent.parent / "state" / "seg_stats.json"
 _seg_stats: dict[str, dict] = {}
@@ -133,7 +134,8 @@ async def lifespan(app: FastAPI):
         while True:
             await asyncio.sleep(20)
             try:
-                store.flush_if_dirty()
+                # 7MB 级 json 序列化扔线程池，不阻塞事件循环（播放不受影响）
+                await asyncio.to_thread(store.flush_if_dirty)
             except Exception:
                 _log.exception("store flush 失败")
 
@@ -277,6 +279,17 @@ async def online_search(keyword: str, budget: float = _SEARCH_BUDGET) -> list:
         ts, items, complete = hit
         if now - ts < (CACHE_TTL if complete else _PARTIAL_TTL):
             return items
+    # 相同关键词并发去重：客户端常连发两次同一查询，共享同一个任务
+    fut = _search_inflight.get(keyword)
+    if fut is not None and not fut.done():
+        return await asyncio.shield(fut)
+    fut = asyncio.ensure_future(_do_online_search(keyword, budget))
+    _search_inflight[keyword] = fut
+    fut.add_done_callback(lambda _t, k=keyword: _search_inflight.pop(k, None))
+    return await asyncio.shield(fut)
+
+
+async def _do_online_search(keyword: str, budget: float) -> list:
     sources = config.enabled_sources()
     titles, complete = await providers.search_all(keyword, sources,
                                                   timeout=budget)

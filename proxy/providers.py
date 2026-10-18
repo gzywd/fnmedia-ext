@@ -259,6 +259,20 @@ async def probe_source(api: str, keyword: str = "庆余年",
             "count": len(lst), "direct": direct, "sample": sample, "error": ""}
 
 
+# 常驻共享连接池：源站连接复用，免去每次搜索的 DNS+TLS 握手（省 0.3-1s）
+_shared_client: httpx.AsyncClient | None = None
+
+
+def shared_client() -> httpx.AsyncClient:
+    global _shared_client
+    if _shared_client is None or _shared_client.is_closed:
+        _shared_client = httpx.AsyncClient(
+            follow_redirects=True, trust_env=False,
+            timeout=httpx.Timeout(HTTP_TIMEOUT),
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32))
+    return _shared_client
+
+
 async def search_all(keyword: str, sources=None, timeout: float | None = None):
     """并发搜索所有启用源。
 
@@ -270,22 +284,19 @@ async def search_all(keyword: str, sources=None, timeout: float | None = None):
     enabled = [s for s in sources if s.get("enabled")]
     if not enabled:
         return [], True
-    client = httpx.AsyncClient(follow_redirects=True, trust_env=False)
-    try:
-        tasks = [asyncio.create_task(search_source(client, s, keyword))
-                 for s in enabled]
-        complete = True
-        if timeout is None:
-            done, pending = await asyncio.wait(tasks)
-        else:
-            done, pending = await asyncio.wait(tasks, timeout=timeout)
-        if pending:
-            complete = False
-            for t in pending:
-                t.cancel()
-            await asyncio.wait(pending, timeout=0.01)
-    finally:
-        pass  # 客户端关闭已挪到函数尾部异步执行
+    client = shared_client()
+    tasks = [asyncio.create_task(search_source(client, s, keyword))
+             for s in enabled]
+    complete = True
+    if timeout is None:
+        done, pending = await asyncio.wait(tasks)
+    else:
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+    if pending:
+        complete = False
+        for t in pending:
+            t.cancel()
+        await asyncio.wait(pending, timeout=0.01)
     titles: list[OnlineTitle] = []
     for t in done:
         try:
@@ -294,9 +305,7 @@ async def search_all(keyword: str, sources=None, timeout: float | None = None):
             continue
         if isinstance(r, list):
             titles.extend(r)
-    # 关键：不同步等待 aclose()——它会把返回卡在慢源的连接拆除上，
-    # 扔到后台关，主流程立刻返回
-    asyncio.get_event_loop().create_task(client.aclose())
+    # 共享常驻连接池：不关闭，连接复用
     return titles, complete
 
 

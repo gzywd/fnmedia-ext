@@ -268,8 +268,13 @@ class Store:
             if len(titles) > _MAX_TITLES:
                 keys = list(titles.keys())[-_MAX_TITLES:]
                 titles = {k: self._titles[k] for k in keys}
+            # 磁盘瘦身：overview/actor/director 是大文本且可再搜即得，
+            # 不落盘，json 体积/写盘耗时降一个量级（内存中保留全量）
+            slim = {k: {kk: vv for kk, vv in v.items()
+                        if kk not in ("overview", "actor", "director")}
+                    for k, v in titles.items()}
             tmp.write_text(json.dumps(
-                {"titles": titles, "orig": self._orig}, ensure_ascii=False))
+                {"titles": slim, "orig": self._orig}, ensure_ascii=False))
             tmp.replace(_STATE)
             self._dirty = False
         except Exception:

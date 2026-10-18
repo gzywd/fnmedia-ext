@@ -153,6 +153,16 @@ future；后台任务随后 `set_result` 抛 `InvalidStateError` → 500 → 客
   新增 `drop_title()` 供 NSFW 清洗同步清索引。
 - 实测：冷搜索 2.8s（预算 2.5 + 本地），缓存命中 11ms；播放链路回归通过。
 
+### 14. 并发与性能审计：连接池复用 + 写盘线程化 + 并发去重（2026-10-18）
+
+- 常驻共享连接池（`providers.shared_client`）：所有源搜索复用 keep-alive 连接，
+  省去每次搜索的 DNS+TLS 握手；实测第 2 个未缓存关键词起总时长 4s+ → 2.5-2.7s。
+- 相同关键词并发去重（`_search_inflight` + `asyncio.shield`）：客户端常连发两次
+  同一查询，现共享同一后台任务，不重复打源站。
+- titles.json 落盘瘦身：overview/actor/director 大文本不再写盘（内存保留全量，
+  重启后详情页简介在下次搜索该词条时恢复），配合 `asyncio.to_thread` 后台落盘，
+  事件循环不再被 7MB 级 json 序列化阻塞（播放代理更顺滑）。
+
 ## 注意
 
 - 只修改 `proxy/app.py`，不动官方二进制 / nginx / 数据库，卸载扩展仍可完整还原。
