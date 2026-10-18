@@ -1093,10 +1093,35 @@ async def hls_main(mg: str, request: Request):
     sel_qs = ""
     if picked.get("line"):
         sel_qs = f"line={urllib.parse.quote(picked['line'])}&index={picked['index']}"
+
+    # AES-128 服务端解密：密钥由本代理获取并缓存，分片解密后按明文 TS 下发，
+    # 播放列表删掉 EXT-X-KEY 行——任何播放器都能直接播
+    dseg_ctx = None
+    m_key = re.search(r'#EXT-X-KEY:METHOD=AES-128[^\n]*URI="([^"]+)"(?:[^\n]*IV=0x([0-9a-fA-F]+))?', text)
+    if m_key:
+        key_url = urllib.parse.urljoin(base_url, m_key.group(1))
+        key = await _get_hls_key(key_url, ext_client(request), picked.get("headers") or {})
+        if key:
+            dseg_ctx = {"key_url": key_url, "iv": (m_key.group(2) or "").lower()}
+
+    seq_base = 0
+    m_seq = re.search(r"#EXT-X-MEDIA-SEQUENCE:(\d+)", text)
+    if m_seq:
+        seq_base = int(m_seq.group(1))
+    seg_i = 0
     out_lines = []
     for raw in text.splitlines():
         line = raw.strip()
-        if line.startswith("#EXT-X-KEY") or line.startswith("#EXT-X-MAP"):
+        if line.startswith("#EXT-X-KEY"):
+            if dseg_ctx:
+                continue  # 服务端解密，密钥不下发
+            def repl(m):
+                uri = m.group(1)
+                absu = urllib.parse.urljoin(base_url, uri)
+                return f'URI="{_seg_url(mg, absu, sel_qs)}"'
+            raw = re.sub(r'URI="([^"]+)"', repl, raw)
+            out_lines.append(raw)
+        elif line.startswith("#EXT-X-MAP"):
             def repl(m):
                 uri = m.group(1)
                 absu = urllib.parse.urljoin(base_url, uri)
@@ -1106,7 +1131,16 @@ async def hls_main(mg: str, request: Request):
         elif line.startswith("#") or not line:
             out_lines.append(raw)
         else:
-            out_lines.append(_seg_url(mg, urllib.parse.urljoin(base_url, line), sel_qs))
+            absu = urllib.parse.urljoin(base_url, line)
+            if dseg_ctx:
+                iv = dseg_ctx["iv"] or f"{seq_base + seg_i:032x}"
+                out_lines.append(
+                    f"{ONLINE_PREFIX}/{mg}/dseg?u={b64e(absu)}"
+                    f"&k={b64e(dseg_ctx['key_url'])}&iv={iv}"
+                    + (f"&{sel_qs}" if sel_qs else ""))
+                seg_i += 1
+            else:
+                out_lines.append(_seg_url(mg, absu, sel_qs))
     body = "\n".join(out_lines) + "\n"
     return Response(body, media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-cache",
@@ -1141,6 +1175,79 @@ async def hls_seg(mg: str, request: Request):
     h = {k: v for k, v in r.headers.items() if k.lower() not in drop}
     h["Access-Control-Allow-Origin"] = "*"
     return Response(content=r.content, status_code=r.status_code, headers=h)
+
+
+# ------------------------------------------------------------- AES-128 服务端解密
+
+_hls_key_cache: dict[str, tuple[float, bytes]] = {}
+
+
+async def _get_hls_key(key_url: str, client: httpx.AsyncClient,
+                       headers: dict) -> bytes | None:
+    """获取并缓存 HLS AES-128 密钥（16B），TTL 10 分钟。"""
+    hit = _hls_key_cache.get(key_url)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    try:
+        r = await client.get(key_url, headers=headers or None, timeout=15)
+        if r.status_code == 200 and len(r.content) == 16:
+            _hls_key_cache[key_url] = (time.time(), r.content)
+            return r.content
+    except Exception:
+        pass
+    return None
+
+
+@app.get(f"{ONLINE_PREFIX}/{{mg}}/dseg")
+async def hls_dseg(mg: str, request: Request):
+    """AES-128 加密分片的服务端解密端点：返回明文 TS（支持 Range）。"""
+    u = request.query_params.get("u", "")
+    ku = request.query_params.get("k", "")
+    ivh = request.query_params.get("iv", "")
+    try:
+        src_url, key_url = b64d(u), b64d(ku)
+        iv = bytes.fromhex(ivh) if ivh else b"\x00" * 16
+        if len(iv) != 16:
+            return Response("bad iv", status_code=400)
+    except Exception:
+        return Response("bad u/k/iv", status_code=400)
+    picked = _pick_episode(mg, request)
+    headers = picked["headers"] if picked else {}
+    key = await _get_hls_key(key_url, ext_client(request), headers)
+    if key is None:
+        return Response("key fail", status_code=502)
+    try:
+        r = await ext_client(request).get(src_url, headers=headers, timeout=30)
+    except Exception as exc:
+        return Response(f"dseg fail {type(exc).__name__}", status_code=502)
+    if r.status_code != 200:
+        return Response(f"upstream {r.status_code}", status_code=502)
+    data = r.content
+    try:
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import unpad
+    except ImportError:
+        return Response("pycryptodome missing", status_code=502)
+    plain = AES.new(key, AES.MODE_CBC, iv).decrypt(data)
+    try:
+        plain = unpad(plain, 16)
+    except ValueError:
+        plain = plain[:len(plain) // 16 * 16]
+    # 播放器可能带 Range：在解密后的明文上自行切片
+    rng = request.headers.get("range")
+    if rng:
+        m = re.match(r"bytes=(\d+)-(\d*)", rng)
+        if m:
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else len(plain) - 1
+            end = min(end, len(plain) - 1)
+            chunk = plain[start:end + 1]
+            return Response(chunk, status_code=206, headers={
+                "Content-Range": f"bytes {start}-{end}/{len(plain)}",
+                "Accept-Ranges": "bytes",
+                "Access-Control-Allow-Origin": "*"})
+    return Response(plain, media_type="video/mp2t",
+                    headers={"Access-Control-Allow-Origin": "*"})
 
 
 # ------------------------------------------------------------- 海报代理

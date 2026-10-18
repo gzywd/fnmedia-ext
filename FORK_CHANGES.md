@@ -172,6 +172,18 @@ future；后台任务随后 `set_result` 抛 `InvalidStateError` → 500 → 客
   +50000 重罚 → 自动选线与 master 排序都把它们排到最后（全部加密时仍可用）。
 - 实测：雍正王朝默认线路回到电影天堂（非加密），加密线路自动回避。
 
+### 16. AES-128 HLS 服务端解密（2026-10-18）
+
+- 加密线路（光速/量子/新狼等）现在由代理**服务端解密**：
+  密钥由 NAS 获取并缓存（TTL 10 分钟），分片在 NAS 上解密后按明文 TS 下发，
+  播放列表删除 `EXT-X-KEY` 行——任何播放器（含飞牛 iOS）都能直接播。
+- 新增 `GET /v/media/online/<mg>/dseg` 解密端点（支持 Range，本地切片 206）。
+- 依赖：venv 新增 `pycryptodome`（requirements.txt 已更新）。
+  ⚠️ 应用中心升级/重装扩展重建 venv 后需重新 `pip install pycryptodome`，
+  缺失时 dseg 返回 502，但明文线路播放不受影响。
+- 代价：解密在 NAS 上进行（每分片 ~1MB AES-CBC，CPU 占用可忽略）；
+  自动选线仍优先明文线路，加密线路作为兜底（此前 +50000 惩罚保留）。
+
 ## 注意
 
 - 只修改 `proxy/app.py`，不动官方二进制 / nginx / 数据库，卸载扩展仍可完整还原。
