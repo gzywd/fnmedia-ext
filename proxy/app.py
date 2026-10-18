@@ -317,6 +317,10 @@ async def _do_online_search(keyword: str, budget: float) -> list:
     items = _merge_items(titles, keyword)
     if complete or items:
         _search_cache[keyword] = (time.time(), items, complete)
+        # 无淘汰会随关键词数无限累积（慢性泄漏），超 300 条删最旧 100 条
+        if len(_search_cache) > 300:
+            for k in sorted(_search_cache, key=lambda k: _search_cache[k][0])[:100]:
+                _search_cache.pop(k, None)
     if not complete:
         _schedule_fill(keyword)
     return items
@@ -1521,20 +1525,29 @@ async def hls_seg(mg: str, request: Request):
     if "range" in request.headers:
         fwd["Range"] = request.headers["range"]
     t0 = time.monotonic()
+    client = ext_client(request)
     try:
-        r = await ext_client(request).get(src_url, headers=fwd)
+        req = client.build_request("GET", src_url, headers=fwd)
+        r = await client.send(req, stream=True)
     except Exception as exc:
         _seg_record(picked["line"].split("::", 1)[0] if picked else "",
                     (time.monotonic() - t0) * 1000, False)
         return Response(f"seg fail {type(exc).__name__}", status_code=502)
-    _seg_record(picked["line"].split("::", 1)[0] if picked else "",
-                (time.monotonic() - t0) * 1000,
-                r.status_code in (200, 206))
     drop = ("content-length", "content-encoding", "transfer-encoding",
             "connection", "content-security-policy")
     h = {k: v for k, v in r.headers.items() if k.lower() not in drop}
     h["Access-Control-Allow-Origin"] = "*"
-    return Response(content=r.content, status_code=r.status_code, headers=h)
+    _seg_record(picked["line"].split("::", 1)[0] if picked else "",
+                (time.monotonic() - t0) * 1000,
+                r.status_code in (200, 206))
+    # 小分片整块返回；大分片流式透传（播放高频路径，避免内存峰值堆积）
+    if int(r.headers.get("content-length") or 0) > 1_000_000:
+        return StreamingResponse(r.aiter_raw(), status_code=r.status_code,
+                                 headers=h,
+                                 background=BackgroundTask(r.aclose))
+    body = await r.aread()
+    await r.aclose()
+    return Response(content=body, status_code=r.status_code, headers=h)
 
 
 # ------------------------------------------------------------- AES-128 服务端解密
@@ -1552,6 +1565,11 @@ async def _get_hls_key(key_url: str, client: httpx.AsyncClient,
         r = await client.get(key_url, headers=headers or None, timeout=15)
         if r.status_code == 200 and len(r.content) == 16:
             _hls_key_cache[key_url] = (time.time(), r.content)
+            # 上限防累积（每条仅 16B+URL，防患于未然）
+            if len(_hls_key_cache) > 500:
+                for k in sorted(_hls_key_cache,
+                                key=lambda k: _hls_key_cache[k][0])[:200]:
+                    _hls_key_cache.pop(k, None)
             return r.content
     except Exception:
         pass

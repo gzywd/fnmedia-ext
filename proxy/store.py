@@ -277,6 +277,10 @@ class Store:
                 {"titles": slim, "orig": self._orig}, ensure_ascii=False))
             tmp.replace(_STATE)
             self._dirty = False
+            # detail_cache 与 titles 同步限容（否则被裁掉的标题残留缓存）
+            if len(self._detail_cache) > _MAX_TITLES:
+                for k in list(self._detail_cache.keys())[:-_MAX_TITLES]:
+                    self._detail_cache.pop(k, None)
         except Exception:
             pass
 
