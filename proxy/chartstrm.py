@@ -96,6 +96,12 @@ def _resolved_tv(og_key: str, guid: str):
     return og, store.tv_episode_guids(og)
 
 
+def _expected_eps(ent: dict) -> int:
+    """豆瓣标注的应有集数："更新至8集"/"47集全" -> 8/47；无法解析返回 0。"""
+    m = re.search(r"(\d+)\s*集", ent.get("episodes_info") or "")
+    return int(m.group(1)) if m else 0
+
+
 def sync_strm() -> dict:
     """按当前榜单缓存重建 strm/nfo/海报（幂等，多余文件清理）。"""
     try:
@@ -120,6 +126,12 @@ def sync_strm() -> dict:
             if is_tv and len(egs) <= 1:
                 # 用户指定：剧集/综艺没解析出多集的（缺集少集）不上墙，
                 # 等每周重搜拿到完整资源后自动出现
+                continue
+            want_eps = _expected_eps(ent)
+            if is_tv and want_eps and len(egs) < want_eps:
+                # 豆瓣标注应有 N 集、资源站集数不够 -> 缺集，不上墙
+                _log.info(f"[chartstrm] 缺集不上墙: {ent.get('title')} "
+                          f"应有{want_eps}集 资源站{len(egs)}集")
                 continue
             n_titles += 1
             stem = f"{title} ({year})" if year else title

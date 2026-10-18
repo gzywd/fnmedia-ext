@@ -196,6 +196,8 @@ def _rexxar_items(data: dict, stype: str) -> list[dict]:
             "rating": _rating_str((x.get("rating") or {}).get("value")),
             "poster": poster,
             "type": stype,
+            # 豆瓣标注的应有集数："更新至8集"/"47集全"，用于缺集过滤
+            "episodes_info": (x.get("episodes_info") or "").strip(),
         })
     return out
 
