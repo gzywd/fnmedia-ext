@@ -573,6 +573,7 @@ async def _chart_resolve(guid: str, max_age: float | None = None) -> str:
             except Exception:
                 results = []
             cand = []
+            best_exact = None   # (可播集数, guid)：同名候选里集数最多者优先
             for r in results:
                 b = store.get_title_by_guid(r.get("guid", ""))
                 if not b or not sum(len(e) for e in b.get("lines", {}).values()):
@@ -582,15 +583,23 @@ async def _chart_resolve(guid: str, max_age: float | None = None) -> str:
                 if yr and by and by != yr:
                     continue
                 if nb == nt:
-                    cand.insert(0, r["guid"])   # 同名同年：最优先
+                    n_eps = sum(len(e) for e in b.get("lines", {}).values())
+                    if best_exact is None or n_eps > best_exact[0]:
+                        best_exact = (n_eps, r["guid"])
                 elif nt and (nt in nb or nb in nt):
                     cand.append(r["guid"])      # 包含关系：次优
-            if cand:
-                _chart_map[guid] = cand[0]
-                _chart_fresh[cand[0]] = time.time()
+            if best_exact:
+                pick = best_exact[1]
+            elif cand:
+                pick = cand[0]
+            else:
+                pick = ""
+            if pick:
+                _chart_map[guid] = pick
+                _chart_fresh[pick] = time.time()
                 _chart_flush()
                 _log.warning(f"[charts] 「{ent.get('title')}」实时搜索到可播资源")
-                return cand[0]
+                return pick
         _log.warning(f"[charts] 「{ent.get('title')}」未找到可播资源")
         # 实时搜索失败时回退旧映射兜底（有旧资源总比直接失败好）
         real = _chart_map.get(guid)
@@ -600,7 +609,11 @@ async def _chart_resolve(guid: str, max_age: float | None = None) -> str:
 
 
 async def _resolve_tv_charts():
-    """解析剧集/综艺的集数（每集 strm 需要集数信息）。已有线路的跳过。"""
+    """解析剧集/综艺的集数（每集 strm 需要集数信息）。
+
+    已解析出多集的跳过；只解析出 0/1 集的重搜（可能之前匹配到了
+    单集版本，换个资源能有完整集数）。
+    """
     import charts as _ch
     for k2, info2 in _ch.CHARTS.items():
         if info2.get("subject_type") != "TV":
@@ -609,7 +622,8 @@ async def _resolve_tv_charts():
             g2 = _chart_guid(k2, e2)
             r0 = _chart_map.get(g2)
             b0 = store.get_title_by_guid(r0) if r0 else None
-            if b0 and b0.get("lines"):
+            if b0 and b0.get("lines") and \
+                    sum(len(e) for e in b0.get("lines", {}).values()) > 1:
                 continue
             await _chart_resolve(g2, max_age=0)
             await asyncio.sleep(3)
