@@ -697,28 +697,55 @@ def _schedule_neighbor_warm(guid: str) -> None:
     asyncio.create_task(_work())
 
 
-def _fastest_line(og: str) -> str:
-    """有可播内容的线路里，按实测 EWMA 速度选最快（AES 线路已被重罚排尾）。
-
-    best_line 只按"直链数/集数"选线，不看速度——实测遇到慢线路
-    （如量子 256ms vs 非凡 226ms）时会把用户卡进慢线。strm 点播改用此函数。
-    """
+def _line_pool(og: str) -> list[str]:
+    """候选线路（按实测速度排序）：直链优先，其次解析型。"""
     brief = store.get_title_by_guid(og)
     if not brief:
-        return ""
-    # 优先有直链的线路；全站这片只有解析型线路时才退而求其次
+        return []
     pool = [ln for ln, eps in brief.get("lines", {}).items()
             if any(e.get("direct") for e in eps)]
     if not pool:
         pool = [ln for ln, eps in brief.get("lines", {}).items()
                 if any(e.get("resolve") for e in eps)]
+    pool.sort(key=lambda ln: (_speed_rank(ln.split("::", 1)[0]), ln))
+    return pool
+
+
+async def _validated_line(request: Request, og: str, ep_idx: int | None,
+                          pool: list[str]) -> str:
+    """按速度顺序实际拉一次播放列表验活，跳过死链/超时；全死返回空。
+
+    资源站直链会过期（6h 缓存期内也可能死），光按速度排会选中死链。
+    """
     if not pool:
         return ""
-    pool.sort(key=lambda ln: (_speed_rank(ln.split("::", 1)[0]), ln))
-    return pool[0]
+    try:
+        client = ext_client(request)
+    except Exception:
+        return pool[0]
+    for ln in pool[:4]:
+        target = store.resolve_episode(og, ln, ep_idx or 0)
+        if not target or target.get("resolve") or not target.get("url"):
+            continue
+        try:
+            r = await client.get(target["url"],
+                                 headers=target.get("headers") or None,
+                                 timeout=4)
+        except Exception:
+            continue
+        if r.status_code == 200 and "#EXTM3U" in (r.text or ""):
+            return ln
+    return ""
 
 
-def _chart_play_redirect(request: Request, og: str, ep_idx: int | None = None):
+def _fastest_line(og: str) -> str:
+    """有直链的线路里按实测 EWMA 速度选最快（旧接口，保留兼容）。"""
+    pool = _line_pool(og)
+    return pool[0] if pool else ""
+
+
+def _chart_play_redirect(request: Request, og: str, ep_idx: int | None = None,
+                         line: str = ""):
     """chartplay 共用出口：解析出的 og（+可选集序号）-> 302 到 HLS preset。"""
     mg = ""
     brief = store.get_title_by_guid(og)
@@ -735,10 +762,8 @@ def _chart_play_redirect(request: Request, og: str, ep_idx: int | None = None):
     if not mg:
         mg = media_guid(og)
     url = f"{str(request.base_url).rstrip('/')}{ONLINE_PREFIX}/{mg}/preset.m3u8"
-    # 单线路直连：跳过播放器逐条探测多线路（首帧快 5~8 秒）。
-    # _pick_episode 对不存在的 line 会自动回退默认线路，无 404 风险。
-    # 选线按实测速度（EWMA）而非集数，避免被卡进慢线。
-    best = _fastest_line(og) or store.best_line(og)
+    # 选线：优先传入的已验证线路，其次按实测速度，最后兜底 best_line
+    best = line or _fastest_line(og) or store.best_line(og)
     if best:
         url += "?line=" + urllib.parse.quote(best, safe="")
     return RedirectResponse(url, status_code=302)
@@ -758,9 +783,16 @@ async def chartplay(guid: str, request: Request):
     real = await _chart_resolve(guid, max_age=_CHART_LINK_TTL)
     if not real:
         return Response("no playable resource", status_code=404)
+    # 验活选线：跳过死链；全死则强制重搜一次拿新直链
+    line = await _validated_line(request, real, None, _line_pool(real))
+    if not line:
+        fresh = await _chart_resolve(guid, max_age=0)
+        if fresh:
+            real = fresh
+            line = await _validated_line(request, real, None, _line_pool(real))
     # 点谁热谁附近：顺带预热同榜单相邻 5 部，下次点隔壁就是秒开
     _schedule_neighbor_warm(guid)
-    return _chart_play_redirect(request, real)
+    return _chart_play_redirect(request, real, line=line)
 
 
 @app.get("/chartplay/{guid}/ep{num}.m3u8")
@@ -776,8 +808,14 @@ async def chartplay_ep(guid: str, num: str, request: Request):
         n = int(num)
     except ValueError:
         return Response("bad episode", status_code=404)
+    line = await _validated_line(request, real, n, _line_pool(real))
+    if not line:
+        fresh = await _chart_resolve(guid, max_age=0)
+        if fresh:
+            real = fresh
+            line = await _validated_line(request, real, n, _line_pool(real))
     _schedule_neighbor_warm(guid)
-    return _chart_play_redirect(request, real, ep_idx=n)
+    return _chart_play_redirect(request, real, ep_idx=n, line=line)
 
 
 @app.get("/v/api/v1/search/list")

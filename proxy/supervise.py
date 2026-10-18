@@ -131,7 +131,9 @@ def main():
     moved = False
     try:
         # 等暂存 socket 就绪
-        for _ in range(80):
+        # 等暂存 socket 就绪（冷启动实测 ~26s：磁盘休眠唤醒 + 24MB 索引加载，
+        # 原 16s 窗口在盘休眠时必超时导致接管失败，放宽到 90s）
+        for _ in range(450):
             if child.poll() is not None:
                 log("uvicorn 提前退出")
                 return 1
