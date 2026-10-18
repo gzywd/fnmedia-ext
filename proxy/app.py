@@ -648,11 +648,15 @@ def _schedule_neighbor_warm(guid: str) -> None:
             import charts
             items = await charts.get_chart(ent["key"])
             key = ent["key"]
-            # 倒序预热（用户指定）：从榜单最后添加的条目往前热
+            # 倒序预热（用户指定）：从点开的这部起，按添加时间往更早的方向热
+            # （创建顺序=榜单排名顺序，点谁就从谁的位置接着往回）
+            idx = next((i for i, e in enumerate(items)
+                        if _chart_guid(key, e) == guid), len(items) - 1)
             warmed = 0
-            for e in reversed(items):
+            for off in range(len(items)):
                 if warmed >= 5:
                     break
+                e = items[(idx - off) % len(items)]
                 g = _chart_guid(key, e)
                 if g in _chart_warming:
                     continue
