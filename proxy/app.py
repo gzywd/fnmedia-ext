@@ -92,12 +92,15 @@ def _seg_record(provider: str, ms: float, ok: bool) -> None:
 
 def _speed_rank(provider: str) -> float:
     """线路排序键：越小越快。没实测过的给中性值，排在中游。
-    AES 加密线路被飞牛播放器拒绝（HTTP 错误），重罚排到最后。"""
+
+    注：AES-128 加密线路早期因飞牛播放器报错被重罚回避；
+    后经服务端完整解密（/dseg 端点 + 播放列表剥 KEY）并端到端验证
+    （解密 TS 同步字节校验通过），2026-10-18 起取消惩罚，按真实速度竞争。
+    """
     st = _seg_stats.get(provider)
     if not st:
         return 2000.0
-    penalty = 50000 if st.get("encrypted") else 0
-    return penalty + float(st.get("ewma_ms", 2000)) + int(st.get("fails", 0)) * 800
+    return float(st.get("ewma_ms", 2000)) + int(st.get("fails", 0)) * 800
 _PARTIAL_TTL = 15.0   # 只抓了部分源的结果缓存时间
 _SEARCH_BUDGET = 2.5  # 在线搜索总预算（秒），用户 2026-10-18 指定：用满 3 秒上限换更全结果
 CACHE_TTL = 120
