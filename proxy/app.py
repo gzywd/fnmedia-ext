@@ -421,26 +421,30 @@ _CHART_STATE = Path(__file__).resolve().parent.parent / "state" / "chart_map.jso
 _chart_items: dict[str, dict] = {}
 # chart guid -> 已解析出的真实在线 guid
 _chart_map: dict[str, str] = {}
+# 在线 guid -> 资源直链最近一次刷新时间（strm 点开时超时自动重搜保鲜）
+_chart_fresh: dict[str, float] = {}
+_CHART_LINK_TTL = 6 * 3600   # 资源站直链一般几小时到几天，6 小时保底足够新
 _chart_locks: dict[str, asyncio.Lock] = {}
 
 
 def _chart_load() -> None:
-    global _chart_items, _chart_map
+    global _chart_items, _chart_map, _chart_fresh
     try:
         j = json.loads(_CHART_STATE.read_text())
         _chart_items = j.get("items", {})
         _chart_map = j.get("map", {})
+        _chart_fresh = j.get("fresh", {})
         _log.warning(f"[charts] 启动加载 items={len(_chart_items)} map={len(_chart_map)}")
     except Exception as _e:
-        _chart_items, _chart_map = {}, {}
+        _chart_items, _chart_map, _chart_fresh = {}, {}, {}
         _log.warning(f"[charts] 启动加载失败: {type(_e).__name__}: {_e}")
 
 
 def _chart_flush() -> None:
     try:
         tmp = _CHART_STATE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"items": _chart_items, "map": _chart_map},
-                                  ensure_ascii=False))
+        tmp.write_text(json.dumps({"items": _chart_items, "map": _chart_map,
+                                   "fresh": _chart_fresh}, ensure_ascii=False))
         tmp.replace(_CHART_STATE)
     except Exception:
         pass
@@ -515,12 +519,19 @@ def _chart_map_get(guid: str) -> str:
     return ""
 
 
-async def _chart_resolve(guid: str) -> str:
-    """把 chart guid 解析成真实在线 guid：懒加载搜索该片名并记住映射。"""
+async def _chart_resolve(guid: str, max_age: float | None = None) -> str:
+    """把 chart guid 解析成真实在线 guid：搜索该片名并记住映射。
+
+    max_age=None：有映射且资源在库即直接返回（飞牛客户端详情流程）。
+    max_age=秒数：映射时间超过该值就重新实时搜索（strm 点开即实时搜资源，
+    保证拿到的是新鲜直链；资源站直链本身会过期）。
+    """
     if not guid.startswith(_CHART_GUID_PFX):
         return ""
     real = _chart_map.get(guid)
-    if real and store.get_title_by_guid(real):
+    if real and store.get_title_by_guid(real) and (
+            max_age is None
+            or time.time() - _chart_fresh.get(real, 0) < max_age):
         return real
     ent = _chart_items.get(guid)
     if not ent:
@@ -547,7 +558,9 @@ async def _chart_resolve(guid: str) -> str:
     lock = _chart_locks.setdefault(guid, asyncio.Lock())
     async with lock:
         real = _chart_map.get(guid)
-        if real and store.get_title_by_guid(real):
+        if real and store.get_title_by_guid(real) and (
+                max_age is None
+                or time.time() - _chart_fresh.get(real, 0) < max_age):
             return real
         # 明确点击，愿意多等：给到 6s 预算（默认搜索 2.5s）
         # 先搜纯中文标题（资源站命中率最高），失败再试 raw_title
@@ -574,10 +587,15 @@ async def _chart_resolve(guid: str) -> str:
                     cand.append(r["guid"])      # 包含关系：次优
             if cand:
                 _chart_map[guid] = cand[0]
+                _chart_fresh[cand[0]] = time.time()
                 _chart_flush()
-                _log.warning(f"[charts] 「{ent.get('title')}」已解析可播资源")
+                _log.warning(f"[charts] 「{ent.get('title')}」实时搜索到可播资源")
                 return cand[0]
         _log.warning(f"[charts] 「{ent.get('title')}」未找到可播资源")
+        # 实时搜索失败时回退旧映射兜底（有旧资源总比直接失败好）
+        real = _chart_map.get(guid)
+        if real and store.get_title_by_guid(real):
+            return real
     return ""
 
 
@@ -621,7 +639,8 @@ async def chartplay(guid: str, request: Request):
     """
     # 装饰器自下而上注册，通配路由先命中，guid 会带上 .m3u8 后缀
     guid = guid.removesuffix(".m3u8")
-    real = await _chart_resolve(guid)
+    # 用户点海报 = 实时搜可用资源；10 分钟内重复点同一部才复用上次结果
+    real = await _chart_resolve(guid, max_age=600)
     if not real:
         return Response("no playable resource", status_code=404)
     mg = ""
