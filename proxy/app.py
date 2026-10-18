@@ -569,7 +569,7 @@ async def _chart_resolve(guid: str, max_age: float | None = None) -> str:
             if not kw:
                 continue
             try:
-                results = await online_search(kw, budget=6.0)
+                results = await online_search(kw, budget=3.5)
             except Exception:
                 results = []
             cand = []
@@ -653,8 +653,14 @@ async def chartplay(guid: str, request: Request):
     if not mg:
         mg = media_guid(real)
     base = str(request.base_url).rstrip("/")
-    return RedirectResponse(f"{base}{ONLINE_PREFIX}/{mg}/preset.m3u8",
-                            status_code=302)
+    url = f"{base}{ONLINE_PREFIX}/{mg}/preset.m3u8"
+    if brief and not inj.is_tv(brief):
+        # 电影直连最优单线路：跳过播放器逐条探测多线路（首帧快 5~8 秒）。
+        # 直链是刚实时搜的，单线路失效风险低；万一失效重新点一次即可。
+        best = store.best_line(real)
+        if best:
+            url += "?line=" + urllib.parse.quote(best, safe="")
+    return RedirectResponse(url, status_code=302)
 
 
 @app.get("/v/api/v1/search/list")
