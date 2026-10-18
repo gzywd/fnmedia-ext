@@ -621,6 +621,25 @@ def _charts_loop_factory():
                                  " ".join(f"{k}={v['count']}" for k, v in st.items()))
                 except Exception:
                     _log.exception("[charts] strm 同步失败")
+                # 预热：把榜单条目提前解析好，6 小时内点开秒开。
+                # 每 3 秒一个不抢资源；已新鲜的跳过（幂等）。
+                try:
+                    import charts as _ch
+                    warmed = skipped = 0
+                    for key in _ch.CHARTS:
+                        for e in await _ch.get_chart(key):
+                            g = _chart_guid(key, e)
+                            r0 = _chart_map.get(g)
+                            if r0 and (time.time() - _chart_fresh.get(r0, 0)
+                                       < _CHART_LINK_TTL):
+                                skipped += 1
+                                continue
+                            await _chart_resolve(g, max_age=0)
+                            warmed += 1
+                            await asyncio.sleep(3)
+                    _log.warning(f"[charts] 预热完成 新解析={warmed} 已新鲜={skipped}")
+                except Exception:
+                    _log.exception("[charts] 预热失败")
             except Exception:
                 _log.exception("[charts] 刷新失败")
                 await asyncio.sleep(3600)
@@ -639,8 +658,9 @@ async def chartplay(guid: str, request: Request):
     """
     # 装饰器自下而上注册，通配路由先命中，guid 会带上 .m3u8 后缀
     guid = guid.removesuffix(".m3u8")
-    # 用户点海报 = 实时搜可用资源；10 分钟内重复点同一部才复用上次结果
-    real = await _chart_resolve(guid, max_age=600)
+    # 点海报：映射 6 小时内视为新鲜（预热/近期点过）直接秒开；
+    # 超过 6 小时才实时重搜（资源站直链会过期）。搜索失败回退旧映射。
+    real = await _chart_resolve(guid, max_age=_CHART_LINK_TTL)
     if not real:
         return Response("no playable resource", status_code=404)
     mg = ""
@@ -654,12 +674,11 @@ async def chartplay(guid: str, request: Request):
         mg = media_guid(real)
     base = str(request.base_url).rstrip("/")
     url = f"{base}{ONLINE_PREFIX}/{mg}/preset.m3u8"
-    if brief and not inj.is_tv(brief):
-        # 电影直连最优单线路：跳过播放器逐条探测多线路（首帧快 5~8 秒）。
-        # 直链是刚实时搜的，单线路失效风险低；万一失效重新点一次即可。
-        best = store.best_line(real)
-        if best:
-            url += "?line=" + urllib.parse.quote(best, safe="")
+    # 单线路直连：跳过播放器逐条探测多线路（首帧快 5~8 秒）。
+    # _pick_episode 对不存在的 line 会自动回退默认线路，无 404 风险。
+    best = store.best_line(real)
+    if best:
+        url += "?line=" + urllib.parse.quote(best, safe="")
     return RedirectResponse(url, status_code=302)
 
 
