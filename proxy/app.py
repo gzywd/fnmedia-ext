@@ -694,6 +694,27 @@ def _schedule_neighbor_warm(guid: str) -> None:
     asyncio.create_task(_work())
 
 
+def _fastest_line(og: str) -> str:
+    """有可播内容的线路里，按实测 EWMA 速度选最快（AES 线路已被重罚排尾）。
+
+    best_line 只按"直链数/集数"选线，不看速度——实测遇到慢线路
+    （如量子 256ms vs 非凡 226ms）时会把用户卡进慢线。strm 点播改用此函数。
+    """
+    brief = store.get_title_by_guid(og)
+    if not brief:
+        return ""
+    # 优先有直链的线路；全站这片只有解析型线路时才退而求其次
+    pool = [ln for ln, eps in brief.get("lines", {}).items()
+            if any(e.get("direct") for e in eps)]
+    if not pool:
+        pool = [ln for ln, eps in brief.get("lines", {}).items()
+                if any(e.get("resolve") for e in eps)]
+    if not pool:
+        return ""
+    pool.sort(key=lambda ln: (_speed_rank(ln.split("::", 1)[0]), ln))
+    return pool[0]
+
+
 def _chart_play_redirect(request: Request, og: str, ep_idx: int | None = None):
     """chartplay 共用出口：解析出的 og（+可选集序号）-> 302 到 HLS preset。"""
     mg = ""
@@ -713,7 +734,8 @@ def _chart_play_redirect(request: Request, og: str, ep_idx: int | None = None):
     url = f"{str(request.base_url).rstrip('/')}{ONLINE_PREFIX}/{mg}/preset.m3u8"
     # 单线路直连：跳过播放器逐条探测多线路（首帧快 5~8 秒）。
     # _pick_episode 对不存在的 line 会自动回退默认线路，无 404 风险。
-    best = store.best_line(og)
+    # 选线按实测速度（EWMA）而非集数，避免被卡进慢线。
+    best = _fastest_line(og) or store.best_line(og)
     if best:
         url += "?line=" + urllib.parse.quote(best, safe="")
     return RedirectResponse(url, status_code=302)
