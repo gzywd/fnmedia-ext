@@ -600,7 +600,9 @@ async def _chart_resolve(guid: str, max_age: float | None = None) -> str:
 
 
 def _charts_loop_factory():
-    async def _charts_loop():        # 启动稍等片刻再校验榜单缓存；之后每 7 天刷一次
+    async def _charts_loop():
+        # 启动稍等片刻再校验；之后每天一轮：榜单数据满 7 天才重抓
+        # （豆瓣周更节奏），strm 同步 + 预热每天补（直链寿命只有几小时）
         await asyncio.sleep(30)
         while True:
             try:
@@ -608,7 +610,7 @@ def _charts_loop_factory():
                 st = charts.charts_state()
                 now = time.time()
                 stale = (not st) or min(
-                    v.get("fetched_at", 0) for v in st.values()) < now - 3 * 86400
+                    v.get("fetched_at", 0) for v in st.values()) < now - 7 * 86400
                 if stale:
                     r = await charts.refresh_all()
                     _log.warning(f"[charts] 定时刷新 ok={r.get('ok')} "
@@ -621,31 +623,54 @@ def _charts_loop_factory():
                                  " ".join(f"{k}={v['count']}" for k, v in st.items()))
                 except Exception:
                     _log.exception("[charts] strm 同步失败")
-                # 预热：把榜单条目提前解析好，6 小时内点开秒开。
-                # 每 3 秒一个不抢资源；已新鲜的跳过（幂等）。
-                try:
-                    import charts as _ch
-                    warmed = skipped = 0
-                    for key in _ch.CHARTS:
-                        for e in await _ch.get_chart(key):
-                            g = _chart_guid(key, e)
-                            r0 = _chart_map.get(g)
-                            if r0 and (time.time() - _chart_fresh.get(r0, 0)
-                                       < _CHART_LINK_TTL):
-                                skipped += 1
-                                continue
-                            await _chart_resolve(g, max_age=0)
-                            warmed += 1
-                            await asyncio.sleep(3)
-                    _log.warning(f"[charts] 预热完成 新解析={warmed} 已新鲜={skipped}")
-                except Exception:
-                    _log.exception("[charts] 预热失败")
+                # 预热改为"点谁热谁附近"（见 _schedule_neighbor_warm）：
+                # 全量预热每天向每个资源站发几百个请求，易触发风控，已废弃
             except Exception:
                 _log.exception("[charts] 刷新失败")
                 await asyncio.sleep(3600)
                 continue
-            await asyncio.sleep(7 * 86400)
+            await asyncio.sleep(24 * 3600)   # 每天巡检一次（榜单满 7 天才重抓）
     return _charts_loop
+
+
+# 点开某条后，后台顺带预热同榜单相邻几部：流量跟着用户真实兴趣走，
+# 每次点击最多额外 5 个搜索（间隔 3 秒），资源站几乎无感。
+_chart_warming: set[str] = set()
+
+
+def _schedule_neighbor_warm(guid: str) -> None:
+    ent = _chart_items.get(guid)
+    if not ent:
+        return
+
+    async def _work():
+        try:
+            import charts
+            items = await charts.get_chart(ent["key"])
+            key = ent["key"]
+            # 倒序预热（用户指定）：从榜单最后添加的条目往前热
+            warmed = 0
+            for e in reversed(items):
+                if warmed >= 5:
+                    break
+                g = _chart_guid(key, e)
+                if g in _chart_warming:
+                    continue
+                r0 = _chart_map.get(g)
+                if r0 and (time.time() - _chart_fresh.get(r0, 0)
+                           < _CHART_LINK_TTL):
+                    continue
+                _chart_warming.add(g)
+                try:
+                    await _chart_resolve(g, max_age=0)
+                    warmed += 1
+                finally:
+                    _chart_warming.discard(g)
+                await asyncio.sleep(3)
+        except Exception:
+            _log.exception("[charts] 邻近预热失败")
+
+    asyncio.create_task(_work())
 
 
 @app.get("/chartplay/{guid}.m3u8")
@@ -679,6 +704,8 @@ async def chartplay(guid: str, request: Request):
     best = store.best_line(real)
     if best:
         url += "?line=" + urllib.parse.quote(best, safe="")
+    # 点谁热谁附近：顺带预热同榜单相邻 5 部，下次点隔壁就是秒开
+    _schedule_neighbor_warm(guid)
     return RedirectResponse(url, status_code=302)
 
 
