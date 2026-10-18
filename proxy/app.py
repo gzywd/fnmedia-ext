@@ -142,7 +142,9 @@ async def lifespan(app: FastAPI):
                 _log.exception("store flush 失败")
 
     tasks = [asyncio.create_task(health.loop()),
-             asyncio.create_task(_store_flusher())]
+             asyncio.create_task(_store_flusher()),
+             asyncio.create_task(_charts_loop_factory()())]
+    _chart_load()
     yield
     for t in tasks:
         t.cancel()
@@ -408,6 +410,198 @@ def _should_online(q: str) -> bool:
     return len(q) >= 7
 
 
+# ------------------------------------------------------------- 豆瓣榜单
+# 用户搜"豆瓣Top250 / 热门电影 / 热门综艺"等关键词时，返回豆瓣榜单条目；
+# 点开某条时才真正去资源站搜索该片名（懒加载），成功后记住映射，
+# 后续详情/选集/播放全部复用既有在线链路。
+
+_CHART_GUID_PFX = "chart_"
+_CHART_STATE = Path(__file__).resolve().parent.parent / "state" / "chart_map.json"
+# chart guid -> 榜单条目（key/rank/title/year/poster/rating）
+_chart_items: dict[str, dict] = {}
+# chart guid -> 已解析出的真实在线 guid
+_chart_map: dict[str, str] = {}
+_chart_locks: dict[str, asyncio.Lock] = {}
+
+
+def _chart_load() -> None:
+    global _chart_items, _chart_map
+    try:
+        j = json.loads(_CHART_STATE.read_text())
+        _chart_items = j.get("items", {})
+        _chart_map = j.get("map", {})
+    except Exception:
+        _chart_items, _chart_map = {}, {}
+
+
+def _chart_flush() -> None:
+    try:
+        tmp = _CHART_STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"items": _chart_items, "map": _chart_map},
+                                  ensure_ascii=False))
+        tmp.replace(_CHART_STATE)
+    except Exception:
+        pass
+
+
+def _chart_guid(key: str, ent: dict) -> str:
+    raw = (ent.get("raw_title") or ent.get("title") or "").strip()
+    h = hashlib.md5(f"{key}:{raw}:{ent.get('year', '')}".encode()).hexdigest()[:24]
+    return _CHART_GUID_PFX + h
+
+
+def _find_cached_brief(ent: dict) -> dict | None:
+    """榜单条目若与已缓存的在线条目同名同年，直接复用（点开即播零等待）。"""
+    nt, yr = _norm_title(ent.get("title", "")), (ent.get("year") or "").strip()
+    best, bestn = None, -1
+    for b in store._titles.values():
+        if _norm_title(b.get("title", "")) != nt:
+            continue
+        if yr and (b.get("year") or "").strip() and (b.get("year") or "").strip() != yr:
+            continue
+        n = sum(len(e) for e in b.get("lines", {}).values())
+        if n > bestn:
+            best, bestn = b, n
+    return best
+
+
+async def _chart_search_list(key: str) -> list:
+    """榜单关键词 -> 伪造的飞牛搜索条目列表（带排名/评分）。"""
+    import charts
+    entries = await charts.get_chart(key)
+    info = charts.CHARTS.get(key, {})
+    cname = info.get("name", key)
+    out = []
+    for ent in entries:
+        guid = _chart_guid(key, ent)
+        _chart_items[guid] = {
+            "key": key, "rank": ent.get("rank", 0),
+            "title": ent.get("title", ""), "raw_title": ent.get("raw_title", ""),
+            "year": ent.get("year", ""), "poster": ent.get("poster", ""),
+            "rating": ent.get("rating", ""),
+        }
+        cached = _find_cached_brief(ent)
+        if cached:
+            _chart_map.setdefault(guid, cached["guid"])
+        brief = cached or {
+            "guid": guid, "online_id": f"chart:{key}",
+            "title": ent.get("title", ""), "type_name":
+                "连续剧" if info.get("subject_type") == "TV" else "电影",
+            "year": ent.get("year", ""), "poster": ent.get("poster", ""),
+            "overview": "", "remarks": "", "score": ent.get("rating", "") or "0",
+            "actor": "", "director": "", "area": "", "lines": {},
+        }
+        item = inj.search_item(brief)
+        rank, rating = ent.get("rank", 0), ent.get("rating", "")
+        label = f"{rank}. {ent.get('title', '')}" if rank else ent.get("title", "")
+        if rating:
+            label += f" ★{rating}"
+        item["title"] = label
+        item["ancestor_name"] = f"豆瓣·{cname}"
+        if info.get("subject_type"):
+            item["type"] = info["subject_type"]
+            item["ancestor_category"] = info["subject_type"]
+        out.append(item)
+    _chart_flush()
+    return out
+
+
+def _chart_map_get(guid: str) -> str:
+    """已解析的映射直接返回（各路由入口做无感转接）。"""
+    if guid.startswith(_CHART_GUID_PFX):
+        return _chart_map.get(guid, "")
+    return ""
+
+
+async def _chart_resolve(guid: str) -> str:
+    """把 chart guid 解析成真实在线 guid：懒加载搜索该片名并记住映射。"""
+    if not guid.startswith(_CHART_GUID_PFX):
+        return ""
+    real = _chart_map.get(guid)
+    if real and store.get_title_by_guid(real):
+        return real
+    ent = _chart_items.get(guid)
+    if not ent:
+        # 进程重启后内存为空：从榜单缓存按 guid 反查条目
+        try:
+            import charts
+            for key in charts.CHARTS:
+                for e in await charts.get_chart(key):
+                    if _chart_guid(key, e) == guid:
+                        ent = {"key": key, "rank": e.get("rank", 0),
+                               "title": e.get("title", ""),
+                               "raw_title": e.get("raw_title", ""),
+                               "year": e.get("year", ""),
+                               "poster": e.get("poster", ""),
+                               "rating": e.get("rating", "")}
+                        _chart_items[guid] = ent
+                        break
+                if ent:
+                    break
+        except Exception:
+            _log.exception("[charts] guid 反查失败")
+        if not ent:
+            return ""
+    lock = _chart_locks.setdefault(guid, asyncio.Lock())
+    async with lock:
+        real = _chart_map.get(guid)
+        if real and store.get_title_by_guid(real):
+            return real
+        # 明确点击，愿意多等：给到 6s 预算（默认搜索 2.5s）
+        # 先搜纯中文标题（资源站命中率最高），失败再试 raw_title
+        nt, yr = _norm_title(ent.get("title", "")), (ent.get("year") or "").strip()
+        for kw in (ent.get("title"), ent.get("raw_title") or ent.get("title")):
+            if not kw:
+                continue
+            try:
+                results = await online_search(kw, budget=6.0)
+            except Exception:
+                results = []
+            cand = []
+            for r in results:
+                b = store.get_title_by_guid(r.get("guid", ""))
+                if not b or not sum(len(e) for e in b.get("lines", {}).values()):
+                    continue
+                nb = _norm_title(b.get("title", ""))
+                by = (b.get("year") or "").strip()
+                if yr and by and by != yr:
+                    continue
+                if nb == nt:
+                    cand.insert(0, r["guid"])   # 同名同年：最优先
+                elif nt and (nt in nb or nb in nt):
+                    cand.append(r["guid"])      # 包含关系：次优
+            if cand:
+                _chart_map[guid] = cand[0]
+                _chart_flush()
+                _log.warning(f"[charts] 「{ent.get('title')}」已解析可播资源")
+                return cand[0]
+        _log.warning(f"[charts] 「{ent.get('title')}」未找到可播资源")
+    return ""
+
+
+def _charts_loop_factory():
+    async def _charts_loop():
+        # 启动稍等片刻再校验榜单缓存；之后每 7 天刷一次
+        await asyncio.sleep(30)
+        while True:
+            try:
+                import charts
+                st = charts.charts_state()
+                now = time.time()
+                stale = (not st) or min(
+                    v.get("fetched_at", 0) for v in st.values()) < now - 3 * 86400
+                if stale:
+                    r = await charts.refresh_all()
+                    _log.warning(f"[charts] 定时刷新 ok={r.get('ok')} "
+                                 f"{({k: v.get('count') for k, v in r.get('stats', {}).items()})}")
+            except Exception:
+                _log.exception("[charts] 刷新失败")
+                await asyncio.sleep(3600)
+                continue
+            await asyncio.sleep(7 * 86400)
+    return _charts_loop
+
+
 @app.get("/v/api/v1/search/list")
 async def search_list(request: Request):
     t0 = time.time()
@@ -424,7 +618,21 @@ async def search_list(request: Request):
     if not isinstance(items, list):
         items = []
     online = []
-    if q and _should_online(q):
+    chart = []
+    chart_key = None
+    if q:
+        try:
+            import charts
+            chart_key = charts.match_chart(q)
+        except Exception:
+            chart_key = None
+    if chart_key:
+        # 命中榜单：直接返回榜单条目，不再搜资源站
+        try:
+            chart = await _chart_search_list(chart_key)
+        except Exception:
+            _log.exception("[charts] 榜单搜索失败 %s", chart_key)
+    elif q and _should_online(q):
         # 硬性时间盒：本地 + 在线合计不超过 3 秒，到点查到什么返回什么
         budget = max(0.3, _SEARCH_BUDGET - (time.time() - t0))
         try:
@@ -434,7 +642,10 @@ async def search_list(request: Request):
         except Exception:
             online = []
     # 在线片库更齐全，默认把在线结果排到前面；可在管理页关闭
-    if config.get().get("online_first", True):
+    if chart:
+        # 榜单命中时榜单永远排最前
+        data["data"] = chart + items
+    elif config.get().get("online_first", True):
         data["data"] = online + items
     else:
         data["data"] = items + online
@@ -446,6 +657,13 @@ async def search_list(request: Request):
 
 @app.get("/v/api/v1/item/{guid}")
 async def item_detail(guid: str, request: Request):
+    # 豆瓣榜单条目：懒加载解析成真实在线资源后再继续
+    if guid.startswith(_CHART_GUID_PFX):
+        real = await _chart_resolve(guid)
+        if not real:
+            return JSONResponse({"code": 1, "msg": "榜单条目暂无可播资源，稍后重试",
+                                 "data": None}, status_code=200)
+        guid = real
     # 伪造的 Season / Episode 节点
     if store.get_episode(guid):
         ep = store.get_episode(guid)
@@ -480,6 +698,7 @@ async def item_detail(guid: str, request: Request):
 
 @app.get("/v/api/v1/season/list/{guid}")
 async def season_list_route(guid: str, request: Request):
+    guid = _chart_map_get(guid) or guid
     brief = store.get_title_by_guid(guid)
     if not brief or not inj.is_tv(brief):
         return await forward_upstream(request)
@@ -488,6 +707,7 @@ async def season_list_route(guid: str, request: Request):
 
 @app.get("/v/api/v1/episode/list/{guid}")
 async def episode_list_route(guid: str, request: Request):
+    guid = _chart_map_get(guid) or guid
     # guid 可能是伪造的 season guid，也可能是 tv guid
     tv = None
     from store import season_guid as _sg
@@ -507,6 +727,7 @@ async def episode_list_route(guid: str, request: Request):
 
 @app.get("/v/api/v1/stream/list/{guid}")
 async def stream_list(guid: str, request: Request):
+    guid = _chart_map_get(guid) or guid
     ep = store.get_episode(guid)
     target = None
     if ep:
@@ -538,6 +759,7 @@ async def play_info(request: Request):
     import json
     body = json.loads(await request.body() or b"{}")
     guid = body.get("item_guid", "")
+    guid = _chart_map_get(guid) or guid
     ep = store.get_episode(guid)
     rec = history.get(guid)
     if ep:
@@ -1266,7 +1488,11 @@ async def online_poster(tok_path: str, request: Request):
     if not u.startswith("http"):
         return Response("", status_code=400)
     try:
-        r = await ext_client(request).get(u, headers={"User-Agent": "Mozilla/5.0"})
+        hdrs = {"User-Agent": "Mozilla/5.0"}
+        # 豆瓣图床反外链：必须带豆瓣 Referer 才回图
+        if "doubanio.com" in urllib.parse.urlparse(u).netloc:
+            hdrs["Referer"] = "https://movie.douban.com/"
+        r = await ext_client(request).get(u, headers=hdrs)
     except Exception:
         return Response("", status_code=502)
     return Response(content=r.content, status_code=r.status_code,
@@ -1414,6 +1640,54 @@ async def ext_health_report():
 async def ext_seg_stats():
     """各源分片实测速度（EWMA 毫秒），供管理页展示/调试。"""
     return {"code": 0, "msg": "", "data": _seg_stats}
+
+
+# ------------------------------------------------------------- 豆瓣榜单 API
+
+@app.get("/v/api/ext/charts")
+async def ext_charts():
+    """榜单概览（名称/条数/更新时间）。"""
+    try:
+        import charts
+    except Exception as exc:
+        return JSONResponse({"code": 500, "msg": str(exc)}, status_code=500)
+    st = charts.charts_state()
+    out = []
+    for key, info in charts.CHARTS.items():
+        s = st.get(key, {})
+        out.append({"key": key, "name": info.get("name", key),
+                    "count": s.get("count", 0),
+                    "fetched_at": s.get("fetched_at", 0)})
+    return {"code": 0, "msg": "", "data": out}
+
+
+@app.get("/v/api/ext/chart/{key}")
+async def ext_chart(key: str):
+    try:
+        import charts
+    except Exception as exc:
+        return JSONResponse({"code": 500, "msg": str(exc)}, status_code=500)
+    if key not in charts.CHARTS:
+        return JSONResponse({"code": 404, "msg": "榜单不存在"}, status_code=404)
+    items = await charts.get_chart(key)
+    st = charts.charts_state().get(key, {})
+    return {"code": 0, "msg": "", "data": {"name": charts.CHARTS[key].get("name", key),
+                                           "fetched_at": st.get("fetched_at", 0),
+                                           "items": items}}
+
+
+@app.post("/v/api/ext/charts/refresh")
+async def ext_charts_refresh():
+    """后台强制刷新全部榜单，立即返回。"""
+    async def _run():
+        try:
+            import charts
+            r = await charts.refresh_all(force=True)
+            _log.warning(f"[charts] 手动刷新 ok={r.get('ok')}")
+        except Exception:
+            _log.exception("[charts] 手动刷新失败")
+    asyncio.create_task(_run())
+    return {"code": 0, "msg": "refreshing"}
 
 
 @app.get("/v/online-admin")

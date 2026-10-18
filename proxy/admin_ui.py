@@ -121,6 +121,20 @@ ADMIN_HTML = r"""<!doctype html>
   </div>
 
   <div class="card">
+    <h2>豆瓣榜单 <span class="badge" id="chartN"></span>
+      <button class="ghost sm" style="margin-left:auto" onclick="refreshCharts()">立即刷新</button>
+    </h2>
+    <div class="row" id="chartTabs" style="margin-bottom:10px"></div>
+    <div id="chartMeta" class="muted" style="margin-bottom:8px"></div>
+    <table>
+      <thead><tr><th style="width:46px">#</th><th>标题</th><th style="width:56px">年份</th>
+        <th style="width:56px">评分</th></tr></thead>
+      <tbody id="chartRows"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
+    </table>
+    <div class="muted" style="margin-top:8px">在飞牛影视里搜索榜单名（如"豆瓣Top250""热门综艺"）即可浏览；点开条目自动搜资源播放。榜单每周自动更新。</div>
+  </div>
+
+  <div class="card">
     <h2>已缓存在线条目 <span class="badge" id="cacheN"></span></h2>
     <div class="row">
       <input type="text" id="kw" placeholder="按标题过滤（先在飞牛搜索过的会出现在这里）" style="flex:1"/>
@@ -287,8 +301,37 @@ async function loadOnline(){
   </tr>`).join("");
 }
 function esc(s){return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+
+let CHART_KEY="";
+async function loadCharts(){
+  const r=await jget("/v/api/ext/charts");
+  const list=r.data||[];$("chartN").textContent=list.length+" 个榜";
+  $("chartTabs").innerHTML=list.map(c=>
+    `<button class="ghost sm" data-k="${c.key}" onclick="showChart('${c.key}')">${esc(c.name)} (${c.count})</button>`).join("");
+  if(list.length&&!CHART_KEY)showChart(list[0].key);
+}
+async function showChart(key){
+  CHART_KEY=key;
+  $("chartTabs").querySelectorAll("button").forEach(b=>
+    b.style.borderColor=b.dataset.k===key?"var(--ac)":"var(--line)");
+  const r=await jget("/v/api/ext/chart/"+key);
+  const d=r.data||{items:[]};
+  const t=d.fetched_at?new Date(d.fetched_at*1000).toLocaleString():"";
+  $("chartMeta").textContent=d.name+" · 共 "+(d.items||[]).length+" 条"+(t?" · 更新于 "+t:"");
+  $("chartRows").innerHTML=(d.items||[]).map(e=>`<tr>
+    <td class="muted">${e.rank}</td>
+    <td><div class="nm">${esc(e.title)}</div></td>
+    <td class="muted">${esc(e.year||"")}</td><td class="muted">${esc(e.rating||"")}</td>
+  </tr>`).join("")||'<tr><td colspan="4" class="muted">暂无数据</td></tr>';
+}
+async function refreshCharts(){
+  toast("正在后台刷新榜单…");
+  await jpost("/v/api/ext/charts/refresh",{});
+  setTimeout(loadCharts,8000);
+}
 $("kw").addEventListener("input",()=>{clearTimeout(window._t);window._t=setTimeout(loadOnline,250)});
 init().catch(e=>{$("st").textContent="未接管/接口不可用";$("st").className="pill off";console.error(e)});
+loadCharts().catch(()=>{});
 </script>
 </body>
 </html>
