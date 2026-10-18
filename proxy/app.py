@@ -471,47 +471,6 @@ def _find_cached_brief(ent: dict) -> dict | None:
     return best
 
 
-async def _chart_search_list(key: str) -> list:
-    """榜单关键词 -> 伪造的飞牛搜索条目列表（带排名/评分）。"""
-    import charts
-    entries = await charts.get_chart(key)
-    info = charts.CHARTS.get(key, {})
-    cname = info.get("name", key)
-    out = []
-    for ent in entries:
-        guid = _chart_guid(key, ent)
-        _chart_items[guid] = {
-            "key": key, "rank": ent.get("rank", 0),
-            "title": ent.get("title", ""), "raw_title": ent.get("raw_title", ""),
-            "year": ent.get("year", ""), "poster": ent.get("poster", ""),
-            "rating": ent.get("rating", ""),
-        }
-        cached = _find_cached_brief(ent)
-        if cached:
-            _chart_map.setdefault(guid, cached["guid"])
-        brief = cached or {
-            "guid": guid, "online_id": f"chart:{key}",
-            "title": ent.get("title", ""), "type_name":
-                "连续剧" if info.get("subject_type") == "TV" else "电影",
-            "year": ent.get("year", ""), "poster": ent.get("poster", ""),
-            "overview": "", "remarks": "", "score": ent.get("rating", "") or "0",
-            "actor": "", "director": "", "area": "", "lines": {},
-        }
-        item = inj.search_item(brief)
-        rank, rating = ent.get("rank", 0), ent.get("rating", "")
-        label = f"{rank}. {ent.get('title', '')}" if rank else ent.get("title", "")
-        if rating:
-            label += f" ★{rating}"
-        item["title"] = label
-        item["ancestor_name"] = f"豆瓣·{cname}"
-        if info.get("subject_type"):
-            item["type"] = info["subject_type"]
-            item["ancestor_category"] = info["subject_type"]
-        out.append(item)
-    _chart_flush()
-    return out
-
-
 def _chart_map_get(guid: str) -> str:
     """已解析的映射直接返回（各路由入口做无感转接）。"""
     if guid.startswith(_CHART_GUID_PFX):
@@ -791,21 +750,7 @@ async def search_list(request: Request):
     if not isinstance(items, list):
         items = []
     online = []
-    chart = []
-    chart_key = None
-    if q:
-        try:
-            import charts
-            chart_key = charts.match_chart(q)
-        except Exception:
-            chart_key = None
-    if chart_key:
-        # 命中榜单：直接返回榜单条目，不再搜资源站
-        try:
-            chart = await _chart_search_list(chart_key)
-        except Exception:
-            _log.exception("[charts] 榜单搜索失败 %s", chart_key)
-    elif q and _should_online(q):
+    if q and _should_online(q):
         # 硬性时间盒：本地 + 在线合计不超过 3 秒，到点查到什么返回什么
         budget = max(0.3, _SEARCH_BUDGET - (time.time() - t0))
         try:
@@ -815,10 +760,7 @@ async def search_list(request: Request):
         except Exception:
             online = []
     # 在线片库更齐全，默认把在线结果排到前面；可在管理页关闭
-    if chart:
-        # 榜单命中时榜单永远排最前
-        data["data"] = chart + items
-    elif config.get().get("online_first", True):
+    if config.get().get("online_first", True):
         data["data"] = online + items
     else:
         data["data"] = items + online
