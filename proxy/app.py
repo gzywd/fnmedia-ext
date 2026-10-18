@@ -599,6 +599,22 @@ async def _chart_resolve(guid: str, max_age: float | None = None) -> str:
     return ""
 
 
+async def _resolve_tv_charts():
+    """解析剧集/综艺的集数（每集 strm 需要集数信息）。已有线路的跳过。"""
+    import charts as _ch
+    for k2, info2 in _ch.CHARTS.items():
+        if info2.get("subject_type") != "TV":
+            continue
+        for e2 in await _ch.get_chart(k2):
+            g2 = _chart_guid(k2, e2)
+            r0 = _chart_map.get(g2)
+            b0 = store.get_title_by_guid(r0) if r0 else None
+            if b0 and b0.get("lines"):
+                continue
+            await _chart_resolve(g2, max_age=0)
+            await asyncio.sleep(3)
+
+
 def _charts_loop_factory():
     async def _charts_loop():
         # 启动稍等片刻再校验；之后每天一轮：榜单数据满 7 天才重抓
@@ -615,10 +631,17 @@ def _charts_loop_factory():
                     r = await charts.refresh_all()
                     _log.warning(f"[charts] 定时刷新 ok={r.get('ok')} "
                                  f"{({k: v.get('count') for k, v in r.get('stats', {}).items()})}")
-                # 榜单落成 strm 文件（豆瓣仓库影视墙），幂等
+                    # 每周刷榜后：解析剧集/综艺的集数（每集 strm 需要集数信息）。
+                    # 已有线路的跳过；每 3 秒一个，约百来部，几十分钟内完成。
+                    try:
+                        await _resolve_tv_charts()
+                    except Exception:
+                        _log.exception("[charts] 剧集解析失败")
+                # 榜单落成 strm/nfo/海报（豆瓣仓库影视墙），幂等。
+                # 含海报下载，放线程池跑，不阻塞事件循环。
                 try:
                     import chartstrm
-                    st = chartstrm.sync_strm()
+                    st = await asyncio.to_thread(chartstrm.sync_strm)
                     _log.warning("[charts] strm 同步 " +
                                  " ".join(f"{k}={v['count']}" for k, v in st.items()))
                 except Exception:
@@ -677,13 +700,37 @@ def _schedule_neighbor_warm(guid: str) -> None:
     asyncio.create_task(_work())
 
 
+def _chart_play_redirect(request: Request, og: str, ep_idx: int | None = None):
+    """chartplay 共用出口：解析出的 og（+可选集序号）-> 302 到 HLS preset。"""
+    mg = ""
+    brief = store.get_title_by_guid(og)
+    if ep_idx is not None:
+        egs = store.tv_episode_guids(og)
+        if egs:
+            n = ep_idx if 0 <= ep_idx < len(egs) else len(egs) - 1
+            mg = ep_media_guid(egs[n])
+    if not mg and brief and inj.is_tv(brief):
+        egs = store.tv_episode_guids(og)
+        if egs:
+            target_eg, _ts = history.resume_episode(egs)
+            mg = ep_media_guid(target_eg or egs[0])
+    if not mg:
+        mg = media_guid(og)
+    url = f"{str(request.base_url).rstrip('/')}{ONLINE_PREFIX}/{mg}/preset.m3u8"
+    # 单线路直连：跳过播放器逐条探测多线路（首帧快 5~8 秒）。
+    # _pick_episode 对不存在的 line 会自动回退默认线路，无 404 风险。
+    best = store.best_line(og)
+    if best:
+        url += "?line=" + urllib.parse.quote(best, safe="")
+    return RedirectResponse(url, status_code=302)
+
+
 @app.get("/chartplay/{guid}.m3u8")
 @app.get("/chartplay/{guid}")
 async def chartplay(guid: str, request: Request):
     """strm 直连播放入口：豆瓣仓库里的 strm 文件指向这里。
 
-    解析榜单条目 -> 电影取正片 / 剧集取智能续播集 -> 302 到 HLS preset
-    （多线路呈现为可切换线路，后续分片全部走既有 HLS 代理）。
+    解析榜单条目 -> 电影取正片 / 剧集取智能续播集 -> 302 到 HLS preset。
     """
     # 装饰器自下而上注册，通配路由先命中，guid 会带上 .m3u8 后缀
     guid = guid.removesuffix(".m3u8")
@@ -692,25 +739,26 @@ async def chartplay(guid: str, request: Request):
     real = await _chart_resolve(guid, max_age=_CHART_LINK_TTL)
     if not real:
         return Response("no playable resource", status_code=404)
-    mg = ""
-    brief = store.get_title_by_guid(real)
-    if brief and inj.is_tv(brief):
-        egs = store.tv_episode_guids(real)
-        if egs:
-            target_eg, _ts = history.resume_episode(egs)
-            mg = ep_media_guid(target_eg or egs[0])
-    if not mg:
-        mg = media_guid(real)
-    base = str(request.base_url).rstrip("/")
-    url = f"{base}{ONLINE_PREFIX}/{mg}/preset.m3u8"
-    # 单线路直连：跳过播放器逐条探测多线路（首帧快 5~8 秒）。
-    # _pick_episode 对不存在的 line 会自动回退默认线路，无 404 风险。
-    best = store.best_line(real)
-    if best:
-        url += "?line=" + urllib.parse.quote(best, safe="")
     # 点谁热谁附近：顺带预热同榜单相邻 5 部，下次点隔壁就是秒开
     _schedule_neighbor_warm(guid)
-    return RedirectResponse(url, status_code=302)
+    return _chart_play_redirect(request, real)
+
+
+@app.get("/chartplay/{guid}/ep{num}.m3u8")
+@app.get("/chartplay/{guid}/ep{num}")
+async def chartplay_ep(guid: str, num: str, request: Request):
+    """每集 strm 入口：/chartplay/<guid>/ep<N>.m3u8，N 为 0 起集序。"""
+    guid = guid.removesuffix(".m3u8")
+    num = num.removesuffix(".m3u8")
+    real = await _chart_resolve(guid, max_age=_CHART_LINK_TTL)
+    if not real:
+        return Response("no playable resource", status_code=404)
+    try:
+        n = int(num)
+    except ValueError:
+        return Response("bad episode", status_code=404)
+    _schedule_neighbor_warm(guid)
+    return _chart_play_redirect(request, real, ep_idx=n)
 
 
 @app.get("/v/api/v1/search/list")
@@ -1795,8 +1843,10 @@ async def ext_charts_refresh():
             import charts
             r = await charts.refresh_all(force=True)
             _log.warning(f"[charts] 手动刷新 ok={r.get('ok')}")
+            await _resolve_tv_charts()
             import chartstrm
-            chartstrm.sync_strm()
+            await asyncio.to_thread(chartstrm.sync_strm)
+            _log.warning("[charts] 手动刷新全流程完成")
         except Exception:
             _log.exception("[charts] 手动刷新失败")
     asyncio.create_task(_run())
