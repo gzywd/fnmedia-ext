@@ -95,7 +95,7 @@ def _speed_rank(provider: str) -> float:
         return 2000.0
     return float(st.get("ewma_ms", 2000)) + int(st.get("fails", 0)) * 800
 _PARTIAL_TTL = 15.0   # 只抓了部分源的结果缓存时间
-_SEARCH_BUDGET = 2.0  # 在线搜索总预算（秒），留 1s 给本地响应和收尾（总时限 3s）
+_SEARCH_BUDGET = 2.5  # 在线搜索总预算（秒），用户 2026-10-18 指定：用满 3 秒上限换更全结果
 CACHE_TTL = 120
 
 
@@ -117,21 +117,35 @@ async def lifespan(app: FastAPI):
     _seg_load()
     # 成人内容硬过滤：清掉历史缓存里的 NSFW 条目（含其播放记录）
     try:
-        purged = [g for g, b in store._titles.items()
+        purged = [g for g, b in list(store._titles.items())
                   if _is_nsfw(b.get("title", ""), b.get("type_name", ""))]
         for g in purged:
-            store._titles.pop(g, None)
-            hist = history._rec.pop(g, None) if hasattr(history, "_rec") else None
+            store.drop_title(g)
+            history._rec.pop(g, None) if hasattr(history, "_rec") else None
         if purged:
-            store._dirty = True
-            store._flush_locked(force=True)
+            history._dirty = True if hasattr(history, "_dirty") else None
+            store.flush_if_dirty()
             _log.warning(f"[nsfw-purge] 清除成人缓存条目 {len(purged)} 条")
     except Exception:
         _log.exception("nsfw purge 失败")
-    tasks = [asyncio.create_task(health.loop())]
+    async def _store_flusher():
+        # titles.json 数 MB，不能在搜索路径同步写；这里 20s 批量落盘
+        while True:
+            await asyncio.sleep(20)
+            try:
+                store.flush_if_dirty()
+            except Exception:
+                _log.exception("store flush 失败")
+
+    tasks = [asyncio.create_task(health.loop()),
+             asyncio.create_task(_store_flusher())]
     yield
     for t in tasks:
         t.cancel()
+    try:
+        store.flush_if_dirty()
+    except Exception:
+        pass
     _seg_flush()
     await app.state.up.aclose()
     await app.state.ext.aclose()

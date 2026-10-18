@@ -270,7 +270,8 @@ async def search_all(keyword: str, sources=None, timeout: float | None = None):
     enabled = [s for s in sources if s.get("enabled")]
     if not enabled:
         return [], True
-    async with httpx.AsyncClient(follow_redirects=True, trust_env=False) as client:
+    client = httpx.AsyncClient(follow_redirects=True, trust_env=False)
+    try:
         tasks = [asyncio.create_task(search_source(client, s, keyword))
                  for s in enabled]
         complete = True
@@ -278,11 +279,13 @@ async def search_all(keyword: str, sources=None, timeout: float | None = None):
             done, pending = await asyncio.wait(tasks)
         else:
             done, pending = await asyncio.wait(tasks, timeout=timeout)
-            if pending:
-                complete = False
-                for t in pending:
-                    t.cancel()
-                await asyncio.wait(pending, timeout=0.01)
+        if pending:
+            complete = False
+            for t in pending:
+                t.cancel()
+            await asyncio.wait(pending, timeout=0.01)
+    finally:
+        pass  # 客户端关闭已挪到函数尾部异步执行
     titles: list[OnlineTitle] = []
     for t in done:
         try:
@@ -291,6 +294,9 @@ async def search_all(keyword: str, sources=None, timeout: float | None = None):
             continue
         if isinstance(r, list):
             titles.extend(r)
+    # 关键：不同步等待 aclose()——它会把返回卡在慢源的连接拆除上，
+    # 扔到后台关，主流程立刻返回
+    asyncio.get_event_loop().create_task(client.aclose())
     return titles, complete
 
 

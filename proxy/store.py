@@ -71,6 +71,9 @@ class Store:
         self._dirty = False
         self._ep_index: dict[str, dict] = {}   # episode guid -> 定位信息（含多线路）
         self._media_index: dict[str, str] = {} # media/video guid -> ("t:"|"e:") + JSON
+        # 增量索引账本：每个标题占用的索引键，便于只重建变化的部分
+        self._idx_media: dict[str, list[str]] = {}
+        self._idx_eps: dict[str, list[str]] = {}
         self._load()
 
     def _load(self):
@@ -88,48 +91,78 @@ class Store:
                 if e.get("direct") or e.get("resolve")]
 
     def _rebuild_index(self):
-        """重建 ep / media 反查索引（集身份与线路解耦，media guid 携带线路）。"""
+        """全量重建 ep / media 反查索引（仅启动/加载时用）。"""
         self._ep_index = {}
         self._media_index = {}
+        self._idx_media = {}
+        self._idx_eps = {}
         for g, brief in self._titles.items():
-            # 标题（电影=整段；剧集默认线路第一集）
-            self._media_index[media_guid(g)] = "t:" + json.dumps({"og": g, "line": ""})
-            self._media_index[video_guid(g)] = "t:" + json.dumps({"og": g, "line": ""})
-            default = self.best_line(g)
-            if not default:
-                continue
-            line_names = list(brief.get("lines", {}).keys())
-            # 以默认线路的集数为基准建立集身份，聚合各线路
-            base = self._direct_eps(brief, default)
-            for i, base_e in enumerate(base):
-                eg = episode_guid(g, "", i)
-                per_line = {}
-                for ln in line_names:
-                    eps = self._direct_eps(brief, ln)
-                    if i < len(eps):
-                        e = eps[i]
-                        per_line[ln] = {"url": e["url"],
-                                        "headers": e.get("headers", {}),
-                                        "ep_title": e.get("title", ""),
-                                        "resolve": bool(e.get("resolve"))}
-                self._ep_index[eg] = {
-                    "ep_guid": eg, "online_guid": g, "index": i, "season": 1,
-                    "season_guid": season_guid(g), "title": brief.get("title", ""),
-                    "default_line": default, "lines": list(per_line.keys()),
-                    "_per": per_line,
-                    "ep_title": base_e.get("title", ""), "line": default,
-                }
-                # 每个有该集的线路都映射一个 media/video guid
-                for ln in per_line:
-                    self._media_index[ep_media_guid(eg, ln)] = \
-                        "e:" + json.dumps({"ep": eg, "line": ln})
-                    self._media_index[ep_video_guid(eg, ln)] = \
-                        "e:" + json.dumps({"ep": eg, "line": ln})
-                # 空线路=默认线路（兼容）
-                self._media_index[ep_media_guid(eg, "")] = \
-                    "e:" + json.dumps({"ep": eg, "line": default})
-                self._media_index[ep_video_guid(eg, "")] = \
-                    "e:" + json.dumps({"ep": eg, "line": default})
+            self._index_title(g, brief)
+
+    def _index_title(self, g: str, brief: dict) -> None:
+        """为单个标题建/换索引（增量）。"""
+        # 清旧
+        for k in self._idx_media.pop(g, []):
+            self._media_index.pop(k, None)
+        for eg in self._idx_eps.pop(g, []):
+            self._ep_index.pop(eg, None)
+        keys: list[str] = []
+        eps: list[str] = []
+        # 标题（电影=整段；剧集默认线路第一集）
+        keys.append(media_guid(g))
+        self._media_index[keys[-1]] = "t:" + json.dumps({"og": g, "line": ""})
+        keys.append(video_guid(g))
+        self._media_index[keys[-1]] = "t:" + json.dumps({"og": g, "line": ""})
+        default = self.best_line(g)
+        if not default:
+            self._idx_media[g] = keys
+            self._idx_eps[g] = eps
+            return
+        line_names = list(brief.get("lines", {}).keys())
+        # 每条线路的集列表只算一次（原来在集数循环里反复调用，平方级）
+        eps_by_line = {ln: self._direct_eps(brief, ln) for ln in line_names}
+        # 以默认线路的集数为基准建立集身份，聚合各线路
+        base = eps_by_line[default]
+        for i, base_e in enumerate(base):
+            eg = episode_guid(g, "", i)
+            per_line = {}
+            for ln in line_names:
+                eps_l = eps_by_line[ln]
+                if i < len(eps_l):
+                    e = eps_l[i]
+                    per_line[ln] = {"url": e["url"],
+                                    "headers": e.get("headers", {}),
+                                    "ep_title": e.get("title", ""),
+                                    "resolve": bool(e.get("resolve"))}
+            self._ep_index[eg] = {
+                "ep_guid": eg, "online_guid": g, "index": i, "season": 1,
+                "season_guid": season_guid(g), "title": brief.get("title", ""),
+                "default_line": default, "lines": list(per_line.keys()),
+                "_per": per_line,
+                "ep_title": base_e.get("title", ""), "line": default,
+            }
+            eps.append(eg)
+            # 每个有该集的线路都映射一个 media/video guid
+            for ln in per_line:
+                for mk in (ep_media_guid(eg, ln), ep_video_guid(eg, ln)):
+                    keys.append(mk)
+                    self._media_index[mk] = "e:" + json.dumps({"ep": eg, "line": ln})
+            # 空线路=默认线路（兼容）
+            for mk in (ep_media_guid(eg, ""), ep_video_guid(eg, "")):
+                keys.append(mk)
+                self._media_index[mk] = "e:" + json.dumps({"ep": eg, "line": default})
+        self._idx_media[g] = keys
+        self._idx_eps[g] = eps
+
+    def drop_title(self, g: str) -> None:
+        """删除标题及其索引（NSFW 清洗用）。"""
+        self._titles.pop(g, None)
+        self._orig.pop(g, None)
+        for k in self._idx_media.pop(g, []):
+            self._media_index.pop(k, None)
+        for eg in self._idx_eps.pop(g, []):
+            self._ep_index.pop(eg, None)
+        self._dirty = True
 
     def resolve_media_guid(self, mg: str) -> Optional[dict]:
         """media/video guid -> 可播放目标（含 url/line/index）。"""
@@ -261,15 +294,31 @@ class Store:
         return briefs
 
     def remember_merged(self, briefs: list[dict]) -> list[dict]:
-        """保存跨源合并后的 brief（guid 已在 brief 内确定）。"""
+        """保存跨源合并后的 brief（guid 已在 brief 内确定）。
+
+        只标脏不落盘：titles.json 已达数 MB，同步写会阻塞事件循环
+        1 秒以上；由后台 flusher（app lifespan）定期批量落盘。
+        """
         with self._lock:
+            changed = []
             for b in briefs:
-                self._titles[b["guid"]] = b
-                self._orig.setdefault(b["guid"], b.get("online_id", ""))
-            self._dirty = True
-            self._flush_locked(force=True)
-            self._rebuild_index()
+                g = b["guid"]
+                old_b = self._titles.get(g)
+                # 内容没变化就跳过（重复搜索零索引开销）
+                if old_b is None or old_b.get("lines") != b.get("lines"):
+                    changed.append(g)
+                self._titles[g] = b
+                self._orig.setdefault(g, b.get("online_id", ""))
+            for g in changed:
+                self._index_title(g, self._titles[g])
+            if changed:
+                self._dirty = True
         return briefs
+
+    def flush_if_dirty(self) -> None:
+        with self._lock:
+            if self._dirty:
+                self._flush_locked()
 
     def get_title_by_guid(self, guid: str) -> Optional[dict]:
         with self._lock:

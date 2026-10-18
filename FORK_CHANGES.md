@@ -140,6 +140,19 @@ future；后台任务随后 `set_result` 抛 `InvalidStateError` → 500 → 客
   （极限挑战第N季）单独成桶、季号升序；本传/大电影同名条目最前；
   衍生综艺/大电影/动画（宝藏行、皇家宝藏等）整体靠后。
 
+### 13. 搜索预算 2.5s + 三处性能修复（2026-10-18）
+
+- 预算：`_SEARCH_BUDGET` 2.0 → 2.5s（用户指定，用满 3 秒上限换更全结果）。
+- 修复一：`search_all` 超时后退出 `async with` 时，`httpx` 客户端关闭会同步等在途
+  慢连接（最坏 ~2s）。改为 `create_task(client.aclose())` 后台关闭，主流程立即返回。
+- 修复二：`remember_merged` 每次搜索都同步写 7MB 的 titles.json（~1.5s 且阻塞
+  事件循环）。改为标脏 + 后台 flusher（20s 批量落盘，停机时兜底落盘）。
+- 修复三：索引重建占 1.7s——① `_direct_eps` 在集数循环内重复调用（平方级），
+  提出循环外；② 改为**增量索引**（`_idx_media/_idx_eps` 账本 + `_index_title`，
+  只重建新增/线路变化的条目；`remember_merged` 内容未变时零索引开销）；
+  新增 `drop_title()` 供 NSFW 清洗同步清索引。
+- 实测：冷搜索 2.8s（预算 2.5 + 本地），缓存命中 11ms；播放链路回归通过。
+
 ## 注意
 
 - 只修改 `proxy/app.py`，不动官方二进制 / nginx / 数据库，卸载扩展仍可完整还原。
