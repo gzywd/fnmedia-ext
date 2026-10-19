@@ -123,9 +123,21 @@ def main():
     env = os.environ.copy()
     env["FNMEDIA_UPSTREAM_SOCK"] = str(UPSTREAM)
     env["PYTHONUNBUFFERED"] = "1"
+    # 性能：uvloop 事件循环 + httptools C 解析器（装了才启用，缺失自动回退）
+    perf_args = []
+    try:
+        import uvloop  # noqa: F401
+        perf_args += ["--loop", "uvloop"]
+    except Exception:
+        pass
+    try:
+        import httptools  # noqa: F401
+        perf_args += ["--http", "httptools"]
+    except Exception:
+        pass
     child = subprocess.Popen(
         [str(PY), "-m", "uvicorn", "app:app", "--app-dir", str(PROXY),
-         "--uds", str(staged), "--no-access-log"],
+         "--uds", str(staged), *perf_args, "--no-access-log"],
         cwd=str(PROXY), env=env)
 
     moved = False

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import hashlib
 import json
 import os
@@ -149,6 +150,10 @@ async def lifespan(app: FastAPI):
              asyncio.create_task(_store_flusher()),
              asyncio.create_task(_charts_loop_factory()())]
     _chart_load()
+    # 启动期缓存（titles/charts 等）已成常驻对象，冻结后 GC 不再反复扫描，
+    # 减少播放过程中的偶发停顿。
+    gc.collect()
+    gc.freeze()
     yield
     for t in tasks:
         t.cancel()
@@ -202,16 +207,27 @@ async def forward_upstream(request: Request) -> Response:
                if k.lower() not in ("connection", "content-length", "host")}
     headers["Host"] = "localhost"
     req = client.build_request(request.method, url, headers=headers, content=body)
+    t0 = time.monotonic()
     try:
         r = await client.send(req, stream=True)
     except Exception as exc:
         return JSONResponse({"code": -1, "msg": f"upstream {type(exc).__name__}", "data": None},
                             status_code=502)
+    ttfb = time.monotonic() - t0
+    if ttfb > 0.5:
+        _log.warning("[slow-upstream] %.0fms %s %s", ttfb * 1000,
+                     request.method, (request.url.path + "?" +
+                                      request.url.query)[:120])
     ctype = (r.headers.get("content-type") or "").lower()
     clength = int(r.headers.get("content-length") or 0)
+    encoded = bool(r.headers.get("content-encoding"))
     resp_headers = {k: v for k, v in r.headers.items()
                     if k.lower() not in ("content-length", "content-encoding",
                                          "transfer-encoding", "connection")}
+    # 媒体分片等大响应保留原始 Content-Length：206 定长比 chunked 更利于
+    # 播放器 seek / 预读。上游带压缩时不能透传（解码后长度不同）。
+    if clength > 0 and not encoded:
+        resp_headers["content-length"] = str(clength)
     # JSON/小响应：整块读出（调用方普遍依赖返回值 .body 解析）
     if "json" in ctype or (0 < clength <= 1_000_000) or request.method == "HEAD":
         content = await r.aread()
@@ -219,9 +235,10 @@ async def forward_upstream(request: Request) -> Response:
         return Response(content=content, status_code=r.status_code,
                         headers=resp_headers,
                         media_type=r.headers.get("content-type"))
-    # 大响应/未知长度流：直接透传字节流
+    # 大响应/未知长度流：直接透传字节流（压缩响应需解码后再转发）
+    stream = r.aiter_bytes() if encoded else r.aiter_raw()
     return StreamingResponse(
-        r.aiter_raw(), status_code=r.status_code, headers=resp_headers,
+        stream, status_code=r.status_code, headers=resp_headers,
         media_type=r.headers.get("content-type"),
         background=BackgroundTask(r.aclose))
 

@@ -184,6 +184,19 @@ future；后台任务随后 `set_result` 抛 `InvalidStateError` → 500 → 客
 - 代价：解密在 NAS 上进行（每分片 ~1MB AES-CBC，CPU 占用可忽略）；
   自动选线仍优先明文线路，加密线路作为兜底（此前 +50000 惩罚保留）。
 
+### 17. 播放流畅度优化（2026-10-19）
+
+- **HTTP 引擎升级**：venv 新增 `uvloop` + `httptools`，`supervise.py` 启动 uvicorn 时
+  自动检测并追加 `--loop uvloop --http httptools`（未安装则静默回退，不影响启动）。
+  代理转发层由纯 Python asyncio+h11 换成 C 实现的解析器与事件循环。
+- **206 分片保留 Content-Length**：`forward_upstream` 对无压缩响应原样透传长度，
+  大响应不再统一走 chunked，改善播放器 seek / 预读；上游带 `Content-Encoding`
+  时改用 `aiter_bytes()` 解码转发，避免丢头后数据错乱。
+- **GC 调优**：启动加载完 titles/charts 索引后执行 `gc.collect(); gc.freeze()`，
+  常驻对象不再被反复扫描，减少播放中的偶发停顿。
+- **慢请求日志**：`forward_upstream` 首字节耗时 >500ms 记 `[slow-upstream]`，
+  便于区分代理延迟与片源延迟。
+
 ## 注意
 
 - 只修改 `proxy/app.py`，不动官方二进制 / nginx / 数据库，卸载扩展仍可完整还原。
