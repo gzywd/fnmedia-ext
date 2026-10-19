@@ -23,6 +23,7 @@ import re
 import time
 from pathlib import Path
 import urllib.parse
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 
 import httpx
@@ -148,6 +149,7 @@ async def lifespan(app: FastAPI):
 
     tasks = [asyncio.create_task(health.loop()),
              asyncio.create_task(_store_flusher()),
+             asyncio.create_task(_pf_gc_loop()),
              asyncio.create_task(_charts_loop_factory()())]
     _chart_load()
     # 启动期缓存（titles/charts 等）已成常驻对象，冻结后 GC 不再反复扫描，
@@ -1498,6 +1500,160 @@ def _first_variant(text: str, base: str) -> str | None:
     return urllib.parse.urljoin(base, uri)
 
 
+# ------------------------------------------------------------- 分片预取缓存
+# 播放器每取一片，后台按顺序把后续分片下好放内存，命中即秒回。
+# 只作用于明文 /seg 线路；AES 解密线路（dseg）不预取。
+_PF_SEGS = max(0, int(os.environ.get("FNMEDIA_PREFETCH_SEGS", "75") or 0))   # 5min@4s
+_PF_MAX_BYTES = max(0, int(os.environ.get("FNMEDIA_PREFETCH_MAX_MB", "256") or 0)) * 1024 * 1024
+_PF_RATE = max(0.5, float(os.environ.get("FNMEDIA_PREFETCH_RATE", "2.0") or 2.0))
+_PF_IDLE_STOP = 90.0
+
+_pf_cache: "OrderedDict[tuple[str, str], tuple[bytes, str]]" = OrderedDict()
+_pf_bytes = 0
+_pf_inflight: dict[tuple[str, str], asyncio.Task] = {}
+_pf_pl: dict[str, dict] = {}       # mg -> {urls, durs, headers, index, ts}
+_pf_cursor: dict[str, int] = {}    # mg -> 播放器最后请求的分片序号
+_pf_seen: dict[str, float] = {}    # mg -> 最后活动时间
+_pf_tasks: dict[str, asyncio.Task] = {}
+_pf_warned: dict[str, float] = {}
+
+
+def _pf_trim() -> None:
+    global _pf_bytes
+    while _pf_cache and _pf_bytes > _PF_MAX_BYTES:
+        _, (data, _) = _pf_cache.popitem(last=False)
+        _pf_bytes -= len(data)
+
+
+def _pf_clear_mg(mg: str) -> None:
+    global _pf_bytes
+    for k in [k for k in _pf_cache if k[0] == mg]:
+        data, _ = _pf_cache.pop(k)
+        _pf_bytes -= len(data)
+
+
+def _pf_put(mg: str, u: str, data: bytes, ctype: str) -> None:
+    global _pf_bytes
+    if not _PF_MAX_BYTES or not data or len(data) > 8 * 1024 * 1024:
+        return
+    old = _pf_cache.pop((mg, u), None)
+    if old:
+        _pf_bytes -= len(old[0])
+    _pf_cache[(mg, u)] = (data, ctype)
+    _pf_bytes += len(data)
+    _pf_trim()
+
+
+async def _pf_gc_loop() -> None:
+    """兜底回收：10 分钟无播放活动整组释放；总量超限由 LRU 淘汰。"""
+    while True:
+        await asyncio.sleep(60)
+        cutoff = time.monotonic() - 600
+        for mg in [m for m, t in _pf_seen.items() if t < cutoff]:
+            _pf_seen.pop(mg, None)
+            _pf_cursor.pop(mg, None)
+            _pf_pl.pop(mg, None)
+            _pf_clear_mg(mg)
+            _pf_warned.pop(mg, None)
+        _pf_trim()
+
+
+def _pf_warn(mg: str, msg: str) -> None:
+    """同一部片 60s 内只告警一次，避免坏源刷屏。"""
+    now = time.monotonic()
+    if now - _pf_warned.get(mg, 0) < 60:
+        return
+    _pf_warned[mg] = now
+    _log.warning("[pf] %s", msg)
+
+
+async def _pf_fetch(mg: str, u: str, urls: list, i: int, headers: dict) -> None:
+    try:
+        r = await app.state.ext.get(urls[i], headers=headers)
+        if r.status_code in (200, 206):
+            _pf_put(mg, u, r.content, r.headers.get("content-type", "video/mp2t"))
+        else:
+            _pf_warn(mg, f"seg {i} -> HTTP {r.status_code}")
+    except Exception as exc:
+        _pf_warn(mg, f"seg {i} fail {type(exc).__name__}")
+    finally:
+        _pf_inflight.pop((mg, u), None)
+
+
+async def _pf_worker(mg: str) -> None:
+    """从播放器当前位置往后预取，追平窗口后退出；有新请求会再次拉起。"""
+    try:
+        while True:
+            pl = _pf_pl.get(mg)
+            if not pl:
+                return
+            urls, durs = pl["urls"], pl["durs"]
+            cur = _pf_cursor.get(mg, -1)
+            if cur < 0:
+                return
+            end = min(cur + _PF_SEGS, len(urls))
+            did = False
+            for i in range(cur + 1, end):
+                if time.monotonic() - _pf_seen.get(mg, 0) > _PF_IDLE_STOP:
+                    return
+                if _pf_cursor.get(mg, -1) != cur:
+                    break          # 播放位置变了，回到外层重新对齐
+                u = b64e(urls[i])
+                if (mg, u) in _pf_cache or (mg, u) in _pf_inflight:
+                    continue
+                t0 = time.monotonic()
+                task = asyncio.create_task(_pf_fetch(mg, u, urls, i, pl["headers"]))
+                _pf_inflight[(mg, u)] = task
+                await task
+                did = True
+                # 预取限速：平均不超过实时码率的 _PF_RATE 倍
+                budget = (durs[i] if i < len(durs) else 4.0) / _PF_RATE - (time.monotonic() - t0)
+                if budget > 0:
+                    await asyncio.sleep(budget)
+            if not did:
+                return
+    finally:
+        _pf_tasks.pop(mg, None)
+
+
+def _pf_note_request(mg: str, u: str) -> None:
+    """记录播放器位置并拉起预取。"""
+    if not _PF_SEGS:
+        return
+    pl = _pf_pl.get(mg)
+    if not pl:
+        return
+    idx = pl["index"].get(u)
+    if idx is None:
+        return
+    _pf_seen[mg] = time.monotonic()
+    _pf_cursor[mg] = idx
+    task = _pf_tasks.get(mg)
+    if not task or task.done():
+        _pf_tasks[mg] = asyncio.create_task(_pf_worker(mg))
+
+
+def _pf_range(data: bytes, rng: str) -> tuple[bytes, dict] | None:
+    m = re.match(r"bytes=(\d*)-(\d*)\s*$", rng or "")
+    if not m:
+        return None
+    start_s, end_s = m.group(1), m.group(2)
+    if not start_s and not end_s:
+        return None
+    total = len(data)
+    if start_s:
+        start = int(start_s)
+        end = min(int(end_s) if end_s else total - 1, total - 1)
+    else:  # bytes=-N
+        start = max(0, total - int(end_s))
+        end = total - 1
+    if start > end or start >= total:
+        return None
+    return data[start:end + 1], {
+        "Content-Range": f"bytes {start}-{end}/{total}",
+        "Content-Length": str(end - start + 1)}
+
+
 @app.get(f"{ONLINE_PREFIX}/{{mg}}/main.m3u8")
 async def hls_main(mg: str, request: Request):
     picked = _pick_episode(mg, request)
@@ -1554,9 +1710,18 @@ async def hls_main(mg: str, request: Request):
         seq_base = int(m_seq.group(1))
     seg_i = 0
     out_lines = []
+    seg_urls: list[str] = []
+    seg_durs: list[float] = []
+    last_dur = 4.0
     for raw in text.splitlines():
         line = raw.strip()
-        if line.startswith("#EXT-X-KEY"):
+        if line.startswith("#EXTINF:"):
+            try:
+                last_dur = float(line.split(":", 1)[1].split(",")[0])
+            except ValueError:
+                last_dur = 4.0
+            out_lines.append(raw)
+        elif line.startswith("#EXT-X-KEY"):
             if dseg_ctx:
                 continue  # 服务端解密，密钥不下发
             def repl(m):
@@ -1576,6 +1741,8 @@ async def hls_main(mg: str, request: Request):
             out_lines.append(raw)
         else:
             absu = urllib.parse.urljoin(base_url, line)
+            seg_urls.append(absu)
+            seg_durs.append(last_dur)
             if dseg_ctx:
                 iv = dseg_ctx["iv"] or f"{seq_base + seg_i:032x}"
                 out_lines.append(
@@ -1585,6 +1752,19 @@ async def hls_main(mg: str, request: Request):
                 seg_i += 1
             else:
                 out_lines.append(_seg_url(mg, absu, sel_qs))
+    if seg_urls and not dseg_ctx:
+        prev = _pf_pl.get(mg)
+        if not prev or prev["urls"] != seg_urls:
+            _pf_clear_mg(mg)   # 切集/切线路：旧分片缓存作废
+            _pf_cursor.pop(mg, None)
+        _pf_pl[mg] = {"urls": seg_urls, "durs": seg_durs,
+                      "headers": dict(picked.get("headers") or {}),
+                      "index": {b64e(x): i for i, x in enumerate(seg_urls)},
+                      "ts": time.time()}
+        if len(_pf_pl) > 4:
+            for old in sorted(_pf_pl, key=lambda k: _pf_pl[k]["ts"])[:-4]:
+                _pf_pl.pop(old, None)
+                _pf_clear_mg(old)
     body = "\n".join(out_lines) + "\n"
     return Response(body, media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-cache",
@@ -1600,6 +1780,29 @@ async def hls_seg(mg: str, request: Request):
         return Response("bad u", status_code=400)
     picked = _pick_episode(mg, request)
     headers = picked["headers"] if picked else {}
+    # 预取缓存命中直接返回；正在预取则短暂等待同一个任务，避免重复下载
+    _pf_note_request(mg, u)
+    hit = _pf_cache.get((mg, u))
+    if not hit:
+        job = _pf_inflight.get((mg, u))
+        if job and not job.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(job), 8)
+            except Exception:
+                pass
+            hit = _pf_cache.get((mg, u))
+    if hit:
+        _pf_cache.move_to_end((mg, u))
+        data, ctype = hit
+        hdr = {"Access-Control-Allow-Origin": "*"}
+        rng = request.headers.get("range")
+        if rng:
+            sliced = _pf_range(data, rng)
+            if sliced:
+                body, extra = sliced
+                return Response(body, status_code=206,
+                                headers={**hdr, **extra}, media_type=ctype)
+        return Response(data, headers=hdr, media_type=ctype)
     # 透传 Range（播放器 seek）
     fwd = dict(headers)
     if "range" in request.headers:
@@ -1752,7 +1955,11 @@ def _up_status() -> str:
 async def ext_status(request: Request):
     return {"ok": True,
             "config": {k: v for k, v in config.get().items() if k != "admin_token"},
-            "cached_titles": len(store._titles)}
+            "cached_titles": len(store._titles),
+            "prefetch": {"segments": len(_pf_cache),
+                         "bytes": _pf_bytes,
+                         "limit_bytes": _PF_MAX_BYTES,
+                         "window": _PF_SEGS}}
 
 
 @app.get("/v/api/ext/online")
